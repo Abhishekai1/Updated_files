@@ -41,7 +41,6 @@ typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
 
-
 float maxlen =100.0;       //maxima distancia del lidar
 float minlen = 0.01;     //minima distancia del lidar
 float max_FOV = 3.0;    // en radianes angulo maximo de vista de la camara
@@ -59,7 +58,8 @@ float max_depth =100.0;
 float min_depth = 8.0;
 double max_var = 50.0; 
 
-float interpol_value = 20.0; // This will be used as base interpolation value
+// Removed static interpol_value as it's now dynamic
+// float interpol_value = 20.0;
 
 bool f_pc = true; 
 
@@ -68,7 +68,6 @@ std::string imgTopic = "/camera/color/image_raw";
 std::string pcTopic = "/velodyne_points";
 
 //matrix calibration lidar and camera
-
 Eigen::MatrixXf Tlc(3,1); // translation matrix lidar-camera
 Eigen::MatrixXf Rlc(3,3); // rotation matrix lidar-camera
 Eigen::MatrixXf Mc(3,4);  // camera calibration matrix
@@ -77,24 +76,21 @@ Eigen::MatrixXf Mc(3,4);  // camera calibration matrix
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
 
-// VLP-16 specific parameters
-const int VLP16_LAYERS = 16;
-const int BASE_INTERPOL = 7;  // Starting interpolation value for first layer
-const int INTERPOL_INCREMENT = 2;  // Increment for each layer
-
-// Function to get dynamic interpolation value for each layer
-int getDynamicInterpolValue(int layer) {
-    return BASE_INTERPOL + (layer * INTERPOL_INCREMENT);
-}
-
-// Function to get layer from row index
-int getLayerFromRow(int row, int total_rows) {
-    return (row * VLP16_LAYERS) / total_rows;
+// Dynamic interpolation function
+int getDynamicInterpolation(float distance) {
+    if (distance < 5)
+        return 6;
+    else if (distance < 10)
+        return 9;
+    else if (distance < 15)
+        return 12;
+    else if (distance < 20)
+        return 15;
+    else
+        return 18;
 }
 
 ///////////////////////////////////////callback
-
-
 
 void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , const ImageConstPtr& in_image)
 {
@@ -139,6 +135,24 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     
   }  
 
+  // Compute average distance for dynamic interpolation
+  double avg_dist = 0.0;
+  int count = 0;
+  for (const auto& pt : cloud_out->points) {
+      double d = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+      if (d > minlen && d < maxlen) {
+          avg_dist += d;
+          count++;
+      }
+  }
+  if (count > 0) {
+      avg_dist /= count;
+  } else {
+      avg_dist = 10.0;
+  }
+
+  // Get dynamic interpolation value based on average distance
+  float interpol_value = getDynamicInterpolation(avg_dist);
 
   //                                                  point cloud to image 
 
@@ -192,17 +206,17 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
        
       }
 
-  ////////////////////////////////////////////// interpolation with dynamic values per layer
+  ////////////////////////////////////////////// interpolation
   //============================================================================================================
   
   arma::vec X = arma::regspace(1, Z.n_cols);  // X = horizontal spacing
   arma::vec Y = arma::regspace(1, Z.n_rows);  // Y = vertical spacing 
 
-  // Calculate maximum interpolation value for determining final image size
-  int max_interpol = getDynamicInterpolValue(VLP16_LAYERS - 1);
   
+
   arma::vec XI = arma:: regspace(X.min(), 1.0, X.max()); // magnify by approx 2
-  arma::vec YI = arma::regspace(Y.min(), 1.0/max_interpol, Y.max()); // Use max interpolation for spacing
+  arma::vec YI = arma::regspace(Y.min(), 1.0/interpol_value, Y.max()); // 
+
 
   arma::mat ZI_near;  
   arma::mat ZI;
@@ -228,72 +242,54 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
   arma::mat Zout = ZI;
   
   
-  //////////////////filtrado de elementos interpolados con el fondo - Dynamic interpolation per layer
-  // Handle zeros in interpolation with dynamic interpolation values
-  for (uint i = 0; i < ZI.n_rows; i++) {
-      int current_layer = getLayerFromRow(i, ZI.n_rows);
-      int dynamic_interpol = getDynamicInterpolValue(current_layer);
-      
-      for (uint j = 0; j < ZI.n_cols; j++) {
-          if (ZI(i, j) == 0) {
-              if (i + dynamic_interpol < ZI.n_rows) {
-                  for (int k = 1; k <= dynamic_interpol; k++) {
-                      Zout(i + k, j) = 0;
-                  }
-              }
-              if (i > dynamic_interpol) {
-                  for (int k = 1; k <= dynamic_interpol; k++) {
-                      Zout(i - k, j) = 0;
-                  }
-              }
-          }
-      }
-  }
-  ZI = Zout;
+  //////////////////filtrado de elementos interpolados con el fondo
+  // Handle zeros in interpolation (restored)
+for (uint i = 0; i < ZI.n_rows; i++) {
+    for (uint j = 0; j < ZI.n_cols; j++) {
+        if (ZI(i, j) == 0) {
+            if (i + interpol_value < ZI.n_rows) {
+                for (int k = 1; k <= interpol_value; k++) {
+                    Zout(i + k, j) = 0;
+                }
+            }
+            if (i > interpol_value) {
+                for (int k = 1; k <= interpol_value; k++) {
+                    Zout(i - k, j) = 0;
+                }
+            }
+        }
+    }
+}
+ZI = Zout;
 
-// Improved adaptive interpolation with layer-specific parameters
-double base_density_threshold = 0.05;
-int max_window_size = 11;
-int min_window_size = 3;
+// Determine data density threshold (you may need to tune this value)
+double density_threshold = 0.05;  // Adjust based on your dataset
+int max_window_size = 9;  // Maximum window size for sparse regions
+int min_window_size = 3;  // Minimum window size for dense regions
 
 for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-    int current_layer = getLayerFromRow(i, ZI.n_rows);
-    int dynamic_interpol = getDynamicInterpolValue(current_layer);
-    
-    // Adjust density threshold based on layer interpolation value
-    double density_threshold = base_density_threshold * (dynamic_interpol / (double)BASE_INTERPOL);
-    
     for (uint j = 1; j < ZI.n_cols - 1; ++j) {
         if (ZI(i, j) == 0) {  // Missing data
             double weighted_sum = 0.0;
             double weight_total = 0.0;
 
-            // Compute local density with adaptive window size
-            int adaptive_search_window = std::min(dynamic_interpol / 2, 5);
+            // Compute local density (number of valid neighbors in a 3x3 window)
             int valid_neighbors = 0;
-            int total_neighbors = 0;
-            
-            for (int di = -adaptive_search_window; di <= adaptive_search_window; ++di) {
-                for (int dj = -adaptive_search_window; dj <= adaptive_search_window; ++dj) {
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
                     int ni = i + di;
                     int nj = j + dj;
 
-                    if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols) {
-                        total_neighbors++;
-                        if (ZI(ni, nj) > 0) {
-                            valid_neighbors++;
-                        }
+                    if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                        valid_neighbors++;
                     }
                 }
             }
 
-            double local_density = (double)valid_neighbors / total_neighbors;
+            // Determine window size based on local density
+            int window_size = (valid_neighbors < density_threshold * 9) ? max_window_size : min_window_size;
 
-            // Determine window size based on local density and layer characteristics
-            int layer_adjusted_max_window = std::min(max_window_size, dynamic_interpol);
-            int window_size = (local_density < density_threshold) ? layer_adjusted_max_window : min_window_size;
-
-            // Enhanced interpolation using the determined window size
+            // Interpolate using the determined window size
             for (int di = -window_size; di <= window_size; ++di) {
                 for (int dj = -window_size; dj <= window_size; ++dj) {
                     int ni = i + di;
@@ -301,11 +297,7 @@ for (uint i = 1; i < ZI.n_rows - 1; ++i) {
 
                     if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
                         double distance = std::sqrt(di * di + dj * dj);
-                        
-                        // Layer-aware weight calculation
-                        double layer_weight_factor = 1.0 + (current_layer * 0.1); // Slightly increase weights for higher layers
-                        double weight = layer_weight_factor / (distance + 1e-6);
-                        
+                        double weight = 1.0 / (distance + 1e-6);  // Distance-based weight
                         weighted_sum += ZI(ni, nj) * weight;
                         weight_total += weight;
                     }
@@ -319,159 +311,115 @@ for (uint i = 1; i < ZI.n_rows - 1; ++i) {
     }
 }
 
-// Enhanced edge preservation with layer-specific processing
-arma::mat Zenhanced = ZI;
-arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
-arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
-arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
 
-// Calculate gradients with layer-aware smoothing
+
+// Compute gradients for edge detection
+  arma::mat Zenhanced = ZI;
+  arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
+  arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
+  arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
+
+// Calculate gradients (finite difference method)
 for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-    int current_layer = getLayerFromRow(i, ZI.n_rows);
-    int dynamic_interpol = getDynamicInterpolValue(current_layer);
-    
     for (uint j = 1; j < ZI.n_cols - 1; ++j) {
-        if (ZI(i, j) > 0) {
-            // Use layer-specific gradient calculation
-            double layer_factor = (double)dynamic_interpol / BASE_INTERPOL;
-            int grad_window = std::max(1, (int)(layer_factor * 0.5));
-            
-            if (j >= grad_window && j < ZI.n_cols - grad_window) {
-                grad_x(i, j) = (ZI(i, j + grad_window) - ZI(i, j - grad_window)) / (2.0 * grad_window);
-            }
-            if (i >= grad_window && i < ZI.n_rows - grad_window) {
-                grad_y(i, j) = (ZI(i + grad_window, j) - ZI(i - grad_window, j)) / (2.0 * grad_window);
-            }
-            
+        if (ZI(i, j) > 0) {  // Only consider valid points
+            grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
+            grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
             grad_mag(i, j) = std::sqrt(grad_x(i, j) * grad_x(i, j) + grad_y(i, j) * grad_y(i, j));
         }
     }
 }
 
-// Layer-adaptive edge threshold
+// Set edge threshold relative to gradient magnitude
+double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));  // Use 10% of max gradient
+
+// Apply edge preservation
 for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-    int current_layer = getLayerFromRow(i, ZI.n_rows);
-    int dynamic_interpol = getDynamicInterpolValue(current_layer);
-    
-    // Calculate layer-specific edge threshold
-    double layer_threshold_factor = 0.08 + (current_layer * 0.02 / VLP16_LAYERS);
-    double local_max_grad = 0.0;
-    
-    // Find local maximum gradient in layer neighborhood
-    int layer_start = std::max(0, (int)(i - dynamic_interpol/2));
-    int layer_end = std::min((int)ZI.n_rows - 1, (int)(i + dynamic_interpol/2));
-    
-    for (int li = layer_start; li <= layer_end; ++li) {
-        for (uint lj = 0; lj < ZI.n_cols; ++lj) {
-            if (grad_mag(li, lj) > local_max_grad) {
-                local_max_grad = grad_mag(li, lj);
-            }
-        }
-    }
-    
-    double edge_threshold = layer_threshold_factor * local_max_grad;
-    
     for (uint j = 1; j < ZI.n_cols - 1; ++j) {
         if (grad_mag(i, j) > edge_threshold) {
-            // Enhanced edge preservation with layer-specific parameters
-            double preservation_strength = 0.7 + (current_layer * 0.2 / VLP16_LAYERS);
-            double weight = std::max(0.0, 1.0 - (grad_mag(i, j) / edge_threshold) * preservation_strength);
+            double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
             Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
         }
     }
 }
 
-// Replace ZI with the enhanced version
+// Replace ZI with the edge-preserved Zenhanced
 ZI = Zenhanced;
 
+
+
   if (f_pc){    
-    //////////////////filtrado de elementos interpolados con el fondo - Dynamic layer processing
+    //////////////////filtrado de elementos interpolados con el fondo
     
-    /// filtrado por varianza with dynamic interpolation values per layer
-    for (uint i = 0; i < ZI.n_rows; i++) {
-        int current_layer = getLayerFromRow(i, ZI.n_rows);
-        int dynamic_interpol = getDynamicInterpolValue(current_layer);
+    /// filtrado por varianza
+  for (uint i=0; i< ((ZI.n_rows-1)/interpol_value); i+=1)       
+      for (uint j=0; j<ZI.n_cols-5 ; j+=1)
+      {
+        double promedio = 0;
+        double varianza = 0;
+        for (uint k=0; k<interpol_value ; k+=1)
+        //  for(uint jj=j; jj<5+j ; jj+=1)
+          promedio = promedio+ZI((i*interpol_value)+k,j);
+
+      //  promedio = promedio / (interpol_value*5.0);    
+        promedio = promedio / interpol_value;    
+
+        for (uint l = 0; l < interpol_value; l++) 
+       //  for(uint jj=j; jj<5+j ; jj+=1)
+          varianza = varianza + pow((ZI((i*interpol_value)+l,j) - promedio), 2.0);  
         
-        // Skip if we don't have enough rows for this layer's interpolation
-        if (i + dynamic_interpol >= ZI.n_rows) continue;
-        
-        for (uint j = 0; j < ZI.n_cols - 5; j++) {
-            double promedio = 0;
-            double varianza = 0;
-            
-            for (int k = 0; k < dynamic_interpol; k++) {
-                if (i + k < ZI.n_rows) {
-                    promedio += ZI(i + k, j);
-                }
-            }
-            
-            promedio = promedio / dynamic_interpol;
-            
-            for (int l = 0; l < dynamic_interpol; l++) {
-                if (i + l < ZI.n_rows) {
-                    varianza += pow((ZI(i + l, j) - promedio), 2.0);
-                }
-            }
-            
-            // Layer-specific variance threshold
-            double layer_max_var = max_var * (1.0 + current_layer * 0.1 / VLP16_LAYERS);
-            
-            if (varianza > layer_max_var) {
-                for (int m = 0; m < dynamic_interpol; m++) {
-                    if (i + m < ZI.n_rows) {
-                        Zout(i + m, j) = 0;
-                    }
-                }
-            }
-        }
-        
-        // Skip ahead by the interpolation value for efficiency
-        i += dynamic_interpol - 1;
-    }
+       // varianza = sqrt(varianza / interpol_value);
+
+        if(varianza>max_var)
+          for (uint m = 0; m < interpol_value; m++) 
+            Zout((i*interpol_value)+m,j) = 0;                 
+      }   
     ZI = Zout;
   }
 
-  ///////// imagen de rango a nube de puntos with layer-aware processing
+  ///////// imagen de rango a nube de puntos  
   int num_pc = 0; 
-  for (uint i = 0; i < ZI.n_rows; i++) {
-      int current_layer = getLayerFromRow(i, ZI.n_rows);
-      int dynamic_interpol = getDynamicInterpolValue(current_layer);
-      
-      // Skip if we don't have enough rows
-      if (i + dynamic_interpol >= ZI.n_rows) continue;
-      
-      for (uint j = 0; j < ZI.n_cols; j++) {
-          float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
+  for (uint i=0; i< ZI.n_rows - interpol_value; i+=1)
+   {       
+      for (uint j=0; j<ZI.n_cols ; j+=1)
+      {
 
-          if (ang < min_FOV - M_PI/2.0 || ang > max_FOV - M_PI/2.0) 
-              continue;
+        float ang = M_PI-((2.0 * M_PI * j )/(ZI.n_cols));
 
-          if (!(Zout(i, j) == 0)) {
-              float pc_modulo = Zout(i, j);
-              float pc_x = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * cos(ang);
-              float pc_y = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * sin(ang);
+        if (ang < min_FOV-M_PI/2.0|| ang > max_FOV - M_PI/2.0) 
+          continue;
 
-              float ang_x_lidar = 0.6 * M_PI / 180.0;
+        if(!(Zout(i,j)== 0 ))
+        {  
+          float pc_modulo = Zout(i,j);
+          float pc_x = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * cos(ang);
+          float pc_y = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * sin(ang);
 
-              Eigen::MatrixXf Lidar_matrix(3, 3);
-              Eigen::MatrixXf result(3, 1);
-              Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
-                             0, 1, 0,
-                             -sin(ang_x_lidar), 0, cos(ang_x_lidar);
+          float ang_x_lidar = 0.6*M_PI/180.0;  
 
-              result << pc_x, pc_y, ZzI(i, j);
-              
-              result = Lidar_matrix * result;
+          Eigen::MatrixXf Lidar_matrix(3,3); //matrix  transformation between lidar and range image. It rotates the angles that it has of error with respect to the ground
+          Eigen::MatrixXf result(3,1);
+          Lidar_matrix <<   cos(ang_x_lidar) ,0                ,sin(ang_x_lidar),
+                            0                ,1                ,0,
+                            -sin(ang_x_lidar),0                ,cos(ang_x_lidar) ;
 
-              point_cloud->points[num_pc].x = result(0);
-              point_cloud->points[num_pc].y = result(1);
-              point_cloud->points[num_pc].z = result(2);
 
-              cloud->push_back(point_cloud->points[num_pc]);
-              num_pc++;
-          }
+          result << pc_x,
+                    pc_y,
+                    ZzI(i,j);
+          
+          result = Lidar_matrix*result;  // rotacion en eje X para correccion
+
+          point_cloud->points[num_pc].x = result(0);
+          point_cloud->points[num_pc].y = result(1);
+          point_cloud->points[num_pc].z = result(2);
+
+          cloud->push_back(point_cloud->points[num_pc]); 
+
+          num_pc++;
+        }
       }
-  }
+   }  
 
   //============================================================================================================
 
@@ -589,7 +537,8 @@ int main(int argc, char** argv)
   nh.getParam("/filter_output_pc", f_pc);
 
   nh.getParam("/x_resolution", angular_resolution_x);
-  nh.getParam("/y_interpolation", interpol_value);
+  // Removed y_interpolation parameter since it's now dynamic
+  // nh.getParam("/y_interpolation", interpol_value);
 
   nh.getParam("/ang_Y_resolution", angular_resolution_y);
   
