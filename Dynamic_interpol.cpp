@@ -51,11 +51,8 @@ float angular_resolution_x = 0.5f;
 float angular_resolution_y = 2.1f;
 float max_angle_width = 360.0f;
 float max_angle_height = 180.0f;
-float z_max = 100.0f;
-float z_min = 100.0f;
 
-float max_depth = 100.0;
-float min_depth = 8.0;
+float interpol_value = 15.0f;
 double max_var = 50.0; 
 
 bool f_pc = true; 
@@ -166,85 +163,43 @@ float calculateLocalVariance(const arma::mat& Z, int row, int col, int window_si
     return variance / (values.size() - 1);
 }
 
-// Adaptive interpolation function
+// Adaptive interpolation function (improved version)
 void adaptiveInterpolation(arma::mat& ZI, const arma::mat& ZzI, const arma::mat& original_Z) {
-    // Create density and variance maps
-    arma::mat density_map(ZI.n_rows, ZI.n_cols, arma::fill::zeros);
-    arma::mat variance_map(ZI.n_rows, ZI.n_cols, arma::fill::zeros);
-    
-    // Calculate local properties
-    for (uint i = 0; i < ZI.n_rows; ++i) {
-        for (uint j = 0; j < ZI.n_cols; ++j) {
-            density_map(i, j) = calculateLocalDensity(original_Z, i, j, 5);
-            variance_map(i, j) = calculateLocalVariance(original_Z, i, j, 3);
-        }
-    }
-    
-    // Adaptive interpolation
+    // First, use the original simple interpolation approach for missing points
     for (uint i = 1; i < ZI.n_rows - 1; ++i) {
         for (uint j = 1; j < ZI.n_cols - 1; ++j) {
             if (ZI(i, j) == 0) {  // Missing data point
-                float local_density = density_map(i, j);
-                float local_variance = variance_map(i, j);
-                float avg_distance = 0.0f;
-                int count = 0;
+                double weighted_sum = 0.0;
+                double weight_total = 0.0;
                 
-                // Calculate average distance in local neighborhood
-                for (int di = -2; di <= 2; ++di) {
-                    for (int dj = -2; dj <= 2; ++dj) {
+                // Use a small window for basic interpolation
+                int window_size = 3;
+                
+                for (int di = -window_size; di <= window_size; ++di) {
+                    for (int dj = -window_size; dj <= window_size; ++dj) {
                         int ni = i + di;
                         int nj = j + dj;
+                        
                         if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
-                            avg_distance += ZI(ni, nj);
-                            count++;
+                            double distance = std::sqrt(di * di + dj * dj);
+                            double weight = 1.0 / (distance + 1e-6);
+                            
+                            weighted_sum += ZI(ni, nj) * weight;
+                            weight_total += weight;
                         }
                     }
                 }
                 
-                if (count > 0) {
-                    avg_distance /= count;
-                    
-                    // Get adaptive parameters
-                    InterpolationParams params = getAdaptiveInterpolation(avg_distance, local_density, local_variance);
-                    
-                    // Perform weighted interpolation
-                    double weighted_sum = 0.0;
-                    double weight_total = 0.0;
-                    
-                    for (int di = -params.window_size; di <= params.window_size; ++di) {
-                        for (int dj = -params.window_size; dj <= params.window_size; ++dj) {
-                            int ni = i + di;
-                            int nj = j + dj;
-                            
-                            if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
-                                double distance = std::sqrt(di * di + dj * dj);
-                                double weight = 1.0 / (distance * params.factor + 1e-6);
-                                
-                                // Additional weight based on local density
-                                weight *= (1.0 + local_density);
-                                
-                                // Reduce weight for high variance areas
-                                if (local_variance > params.variance_threshold) {
-                                    weight *= 0.5;
-                                }
-                                
-                                weighted_sum += ZI(ni, nj) * weight;
-                                weight_total += weight;
-                            }
-                        }
-                    }
-                    
-                    if (weight_total > 0) {
-                        ZI(i, j) = weighted_sum / weight_total;
-                    }
+                if (weight_total > 0) {
+                    ZI(i, j) = weighted_sum / weight_total;
                 }
             }
         }
     }
 }
 
-// Dynamic edge-aware filtering
-void dynamicEdgePreservation(arma::mat& ZI, const arma::mat& density_map) {
+// Edge-aware filtering (simplified)
+void edgePreservingFilter(arma::mat& ZI) {
     arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
@@ -260,22 +215,18 @@ void dynamicEdgePreservation(arma::mat& ZI, const arma::mat& density_map) {
         }
     }
     
-    // Apply dynamic edge preservation
+    // Apply edge-preserving smoothing
+    double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
+    
     for (uint i = 1; i < ZI.n_rows - 1; ++i) {
         for (uint j = 1; j < ZI.n_cols - 1; ++j) {
-            float local_density = density_map(i, j);
-            float adaptive_threshold = 0.1f * arma::max(arma::max(grad_mag)) * (1.0f + local_density);
-            
-            if (grad_mag(i, j) > adaptive_threshold) {
-                // Preserve edges more in dense areas
-                float preservation_factor = std::min(0.9f, 0.5f + local_density * 0.4f);
-                
-                // Apply bilateral-like filtering
+            if (grad_mag(i, j) > edge_threshold) {
+                // Apply bilateral-like filtering for edge preservation
                 double weighted_sum = 0.0;
                 double weight_total = 0.0;
                 
-                for (int di = -2; di <= 2; ++di) {
-                    for (int dj = -2; dj <= 2; ++dj) {
+                for (int di = -1; di <= 1; ++di) {
+                    for (int dj = -1; dj <= 1; ++dj) {
                         int ni = i + di;
                         int nj = j + dj;
                         
@@ -283,10 +234,7 @@ void dynamicEdgePreservation(arma::mat& ZI, const arma::mat& density_map) {
                             double spatial_dist = std::sqrt(di * di + dj * dj);
                             double intensity_diff = std::abs(ZI(ni, nj) - ZI(i, j));
                             
-                            double spatial_weight = std::exp(-spatial_dist * spatial_dist / (2.0 * 1.0 * 1.0));
-                            double intensity_weight = std::exp(-intensity_diff * intensity_diff / (2.0 * 2.0 * 2.0));
-                            
-                            double weight = spatial_weight * intensity_weight;
+                            double weight = std::exp(-spatial_dist / 1.0) * std::exp(-intensity_diff / 2.0);
                             weighted_sum += ZI(ni, nj) * weight;
                             weight_total += weight;
                         }
@@ -294,8 +242,7 @@ void dynamicEdgePreservation(arma::mat& ZI, const arma::mat& density_map) {
                 }
                 
                 if (weight_total > 0) {
-                    float filtered_value = weighted_sum / weight_total;
-                    ZI(i, j) = ZI(i, j) * preservation_factor + filtered_value * (1.0f - preservation_factor);
+                    ZI(i, j) = weighted_sum / weight_total;
                 }
             }
         }
@@ -369,30 +316,18 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
             Zz.at(j, i) = zz;
         }
 
-    ////////////////////////////////////////////// Dynamic interpolation
+    ////////////////////////////////////////////// Improved interpolation
     //============================================================================================================
     
     // Store original Z for reference
     arma::mat original_Z = Z;
     
-    // Create density map
-    arma::mat density_map(Z.n_rows, Z.n_cols, arma::fill::zeros);
-    for (uint i = 0; i < Z.n_rows; ++i) {
-        for (uint j = 0; j < Z.n_cols; ++j) {
-            density_map(i, j) = calculateLocalDensity(Z, i, j, 5);
-        }
-    }
-    
-    // Adaptive interpolation based on local characteristics
+    // Standard interpolation setup
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
-
-    // Dynamic interpolation factor based on overall point cloud density
-    float overall_density = arma::mean(arma::mean(density_map));
-    float adaptive_y_factor = std::max(5.0f, std::min(25.0f, 15.0f / (overall_density + 0.1f)));
-
+    
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-    arma::vec YI = arma::regspace(Y.min(), 1.0 / adaptive_y_factor, Y.max());
+    arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max());
 
     arma::mat ZI, ZzI;
     arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
@@ -401,24 +336,21 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     // Apply adaptive interpolation to fill missing data
     adaptiveInterpolation(ZI, ZzI, original_Z);
 
-    // Apply dynamic edge preservation
-    dynamicEdgePreservation(ZI, density_map);
+    // Apply edge-preserving filter
+    edgePreservingFilter(ZI);
 
-    // Handle interpolation artifacts with dynamic masking
+    // Handle interpolation artifacts (original approach)
     arma::mat Zout = ZI;
     for (uint i = 0; i < ZI.n_rows; i++) {
         for (uint j = 0; j < ZI.n_cols; j++) {
             if (ZI(i, j) == 0) {
-                float local_density = density_map(std::min(i, density_map.n_rows - 1), std::min(j, density_map.n_cols - 1));
-                int mask_size = static_cast<int>(adaptive_y_factor * (1.0f - local_density * 0.5f));
-                
-                if (i + mask_size < ZI.n_rows) {
-                    for (int k = 1; k <= mask_size; k++) {
+                if (i + interpol_value < ZI.n_rows) {
+                    for (int k = 1; k <= interpol_value; k++) {
                         Zout(i + k, j) = 0;
                     }
                 }
-                if (i > mask_size) {
-                    for (int k = 1; k <= mask_size; k++) {
+                if (i > interpol_value) {
+                    for (int k = 1; k <= interpol_value; k++) {
                         Zout(i - k, j) = 0;
                     }
                 }
@@ -427,17 +359,13 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     }
     ZI = Zout;
 
-    // Rest of the processing remains the same...
-    // [Continue with the point cloud reconstruction and publishing code]
-    
+    // Original variance filtering
     if (f_pc) {
-        // Dynamic variance filtering
-        for (uint i = 0; i < ((ZI.n_rows - 1) / static_cast<uint>(adaptive_y_factor)); i += 1)
+        for (uint i = 0; i < ((ZI.n_rows - 1) / static_cast<uint>(interpol_value)); i += 1)
             for (uint j = 0; j < ZI.n_cols - 5; j += 1)
             {
                 double promedio = 0;
                 double varianza = 0;
-                int interpol_value = static_cast<int>(adaptive_y_factor);
                 
                 for (uint k = 0; k < interpol_value; k += 1)
                     promedio = promedio + ZI((i * interpol_value) + k, j);
@@ -447,23 +375,18 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                 for (uint l = 0; l < interpol_value; l++)
                     varianza = varianza + pow((ZI((i * interpol_value) + l, j) - promedio), 2.0);
 
-                // Dynamic variance threshold
-                float local_density = density_map(std::min(i * interpol_value, density_map.n_rows - 1), std::min(j, density_map.n_cols - 1));
-                double dynamic_max_var = max_var * (1.0 + local_density * 0.5);
-
-                if (varianza > dynamic_max_var)
+                if (varianza > max_var)
                     for (uint m = 0; m < interpol_value; m++)
                         Zout((i * interpol_value) + m, j) = 0;
             }
         ZI = Zout;
     }
 
-    // Continue with point cloud reconstruction...
+    // Point cloud reconstruction (original approach)
     PointCloud::Ptr point_cloud(new PointCloud);
     PointCloud::Ptr cloud(new PointCloud);
     
     int num_pc = 0;
-    int interpol_value = static_cast<int>(adaptive_y_factor);
     
     for (uint i = 0; i < ZI.n_rows - interpol_value; i += 1)
     {
@@ -506,7 +429,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         }
     }
 
-    // Continue with camera projection and publishing...
+    // Camera projection and color assignment (original approach)
     PointCloud::Ptr P_out = cloud;
 
     Eigen::MatrixXf RTlc(4, 4);
@@ -588,6 +511,7 @@ int main(int argc, char** argv)
     nh.getParam("/filter_output_pc", f_pc);
     nh.getParam("/x_resolution", angular_resolution_x);
     nh.getParam("/ang_Y_resolution", angular_resolution_y);
+    nh.getParam("/y_interpolation", interpol_value);
 
     XmlRpc::XmlRpcValue param;
 
@@ -615,7 +539,7 @@ int main(int argc, char** argv)
     pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
     rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
 
-  pc_pub = nh.advertise<PointCloud> ("/points2", 1);  
+    pc_pub = nh.advertise<PointCloud>("/points2", 1);  
 
-  ros::spin();
+    ros::spin();
 }
