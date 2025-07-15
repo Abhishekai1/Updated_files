@@ -613,7 +613,7 @@ int main(int argc, char** argv)
     Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
     sync.registerCallback(boost::bind(&callback, _1, _2));
     pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
-    rangeImage = boost::shared_ptr<pcl::RangeImageSp
+    rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
 
   pc_pub = nh.advertise<PointCloud> ("/points2", 1);  
 
