@@ -128,79 +128,71 @@ arma::mat createDynamicInterpolationGrid(const arma::mat& rangeData, const arma:
 }
 
 // Enhanced interpolation function with distance-based adaptive interpolation
-void performDynamicInterpolation(arma::mat& ZI, arma::mat& ZzI, const arma::mat& Z, 
-                                const arma::mat& Zz, int rows_img, int cols_img) {
-    
-    // Create distance-based interpolation grid
+// === Replace performDynamicInterpolation() with this improved version ===
+
+void performDynamicInterpolation(arma::mat& ZI, arma::mat& ZzI, const arma::mat& Z, const arma::mat& Zz, int rows_img, int cols_img) {
+    arma::mat ZI_temp = arma::zeros(rows_img, cols_img);
+    arma::mat ZzI_temp = arma::zeros(rows_img, cols_img);
+    arma::mat weight_map = arma::zeros(rows_img, cols_img);
+
+    std::vector<std::pair<float, float>> ranges = {
+        {0.0f, 5.0f}, {5.0f, 10.0f}, {10.0f, 15.0f},
+        {15.0f, 20.0f}, {20.0f, 25.0f}, {25.0f, 100.0f}
+    };
+
     arma::vec X = arma::regspace(1, cols_img);
     arma::vec Y = arma::regspace(1, rows_img);
-    
-    // Calculate adaptive interpolation factors
-    arma::mat distanceMap = Z;
-    float maxInterpolFactor = 0.0f;
-    
-    for (int i = 0; i < rows_img; ++i) {
-        for (int j = 0; j < cols_img; ++j) {
-            if (Z(i, j) > 0) {
-                float interpol_factor = getDynamicInterpolationFactor(Z(i, j));
-                maxInterpolFactor = std::max(maxInterpolFactor, interpol_factor);
+
+    for (auto& range : ranges) {
+        float d_min = range.first;
+        float d_max = range.second;
+        float interpol_factor = getDynamicInterpolationFactor((d_min + d_max) / 2.0f);
+
+        arma::umat mask = (Z >= d_min) && (Z < d_max);
+
+        if (arma::accu(mask) == 0) continue;  // Skip empty bands
+
+        arma::mat Z_masked = arma::zeros(rows_img, cols_img);
+        arma::mat Zz_masked = arma::zeros(rows_img, cols_img);
+
+        for (int i = 0; i < rows_img; ++i) {
+            for (int j = 0; j < cols_img; ++j) {
+                if (mask(i, j)) {
+                    Z_masked(i, j) = Z(i, j);
+                    Zz_masked(i, j) = Zz(i, j);
+                }
             }
         }
-    }
-    
-    // Use maximum interpolation factor for uniform grid
-    arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-    arma::vec YI = arma::regspace(Y.min(), 1.0/maxInterpolFactor, Y.max());
-    
-    // Perform initial interpolation
-    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
-    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
-    
-    // Apply distance-based adaptive filtering
-    arma::mat ZI_filtered = ZI;
-    arma::mat ZzI_filtered = ZzI;
-    
-    for (uint i = 0; i < ZI.n_rows; ++i) {
-        for (uint j = 0; j < ZI.n_cols; ++j) {
-            if (ZI(i, j) > 0) {
-                float distance = ZI(i, j);
-                float local_interpol_factor = getDynamicInterpolationFactor(distance);
-                
-                // Apply distance-based smoothing
-                if (local_interpol_factor > 6.0f) {
-                    // For distant points, apply more aggressive smoothing
-                    int window_size = std::min(5, (int)(local_interpol_factor / 4.0f));
-                    double sum_range = 0.0;
-                    double sum_height = 0.0;
-                    int count = 0;
-                    
-                    for (int di = -window_size; di <= window_size; ++di) {
-                        for (int dj = -window_size; dj <= window_size; ++dj) {
-                            int ni = i + di;
-                            int nj = j + dj;
-                            
-                            if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols) {
-                                if (ZI(ni, nj) > 0) {
-                                    double weight = 1.0 / (1.0 + std::sqrt(di*di + dj*dj));
-                                    sum_range += ZI(ni, nj) * weight;
-                                    sum_height += ZzI(ni, nj) * weight;
-                                    count++;
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (count > 0) {
-                        ZI_filtered(i, j) = sum_range / count;
-                        ZzI_filtered(i, j) = sum_height / count;
-                    }
+
+        arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
+        arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_factor, Y.max());
+
+        arma::mat ZI_local, ZzI_local;
+        arma::interp2(X, Y, Z_masked, XI, YI, ZI_local, "linear");
+        arma::interp2(X, Y, Zz_masked, XI, YI, ZzI_local, "linear");
+
+        for (uint i = 0; i < ZI_local.n_rows && i < rows_img; ++i) {
+            for (uint j = 0; j < ZI_local.n_cols && j < cols_img; ++j) {
+                if (ZI_local(i, j) > 0) {
+                    ZI_temp(i, j) += ZI_local(i, j);
+                    ZzI_temp(i, j) += ZzI_local(i, j);
+                    weight_map(i, j) += 1.0;
                 }
             }
         }
     }
-    
-    ZI = ZI_filtered;
-    ZzI = ZzI_filtered;
+
+    ZI = arma::zeros(rows_img, cols_img);
+    ZzI = arma::zeros(rows_img, cols_img);
+
+    for (int i = 0; i < rows_img; ++i) {
+        for (int j = 0; j < cols_img; ++j) {
+            if (weight_map(i, j) > 0) {
+                ZI(i, j) = ZI_temp(i, j) / weight_map(i, j);
+                ZzI(i, j) = ZzI_temp(i, j) / weight_map(i, j);
+            }
+        }
+    }
 }
 
 ///////////////////////////////////////callback
