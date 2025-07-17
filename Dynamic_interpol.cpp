@@ -194,15 +194,15 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
       arma::mat layer_Z = Z.submat(layer_start, 0, layer_end - 1, Z.n_cols - 1);
       arma::mat layer_Zz = Zz.submat(layer_start, 0, layer_end - 1, Zz.n_cols - 1);
       
-      // Create interpolation vectors for this layer
-arma::vec X_layer = arma::regspace(1, layer_Z.n_cols);
-arma::vec Y_layer = arma::regspace(1, layer_Z.n_rows);
-arma::vec unique_Y = arma::unique(Y_layer);
-
-if (layer_Z.n_rows < 2 || unique_Y.n_elem < 2) {
-    ROS_WARN("Skipping layer %d: Y vector doesn't have enough unique elements.", layer);
+if (layer_Z.n_rows < 2 || layer_Z.n_cols < 2 || arma::accu(layer_Z != 0) < 4) {
+    ROS_WARN("Skipping layer %d: not enough data points. Rows: %d, Cols: %d, Non-zeros: %d",
+             layer, (int)layer_Z.n_rows, (int)layer_Z.n_cols, (int)arma::accu(layer_Z != 0));
     continue;
 }
+
+arma::vec X_layer = arma::linspace(1, layer_Z.n_cols, layer_Z.n_cols);
+arma::vec Y_layer = arma::linspace(1, layer_Z.n_rows, layer_Z.n_rows);
+
 
 
 
