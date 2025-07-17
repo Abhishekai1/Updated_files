@@ -196,7 +196,12 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
       
       // Create interpolation vectors for this layer
       arma::vec X_layer = arma::regspace(1, layer_Z.n_cols);
-      arma::vec Y_layer = arma::regspace(1, layer_Z.n_rows);
+      if (layer_Z.n_rows < 2 || arma::unique(arma::regspace(1, layer_Z.n_rows)).n_elem < 2) {
+    ROS_WARN("Skipping layer %d: Y vector doesn't have enough unique elements.", layer);
+    continue;
+}
+
+
       
       // Dynamic interpolation spacing
       arma::vec YI_layer = arma::regspace(Y_layer.min(), 1.0/current_interpolation, Y_layer.max());
