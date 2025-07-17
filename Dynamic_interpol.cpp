@@ -58,7 +58,7 @@ float max_depth =100.0;
 float min_depth = 8.0;
 double max_var = 50.0; 
 
-float interpol_value = 20.0; // Base interpolation value
+float interpol_value = 20.0;
 
 bool f_pc = true; 
 
@@ -75,127 +75,8 @@ Eigen::MatrixXf Mc(3,4);  // camera calibration matrix
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
 
-// Function to calculate dynamic interpolation factor based on distance
-float getDynamicInterpolationFactor(float distance) {
-    if (distance <= 5.0f) {
-        return 6.0f;  // 6 interpolated lines between layers for 0-5m
-    } else if (distance <= 10.0f) {
-        return 9.0f;  // 9 interpolated lines for 5-10m
-    } else if (distance <= 15.0f) {
-        return 12.0f; // 12 interpolated lines for 10-15m
-    } else if (distance <= 20.0f) {
-        return 15.0f; // 15 interpolated lines for 15-20m
-    } else if (distance <= 25.0f) {
-        return 18.0f; // 18 interpolated lines for 20-25m
-    } else {
-        return 20.0f; // 20 interpolated lines for >25m
-    }
-}
-
-// Function to create dynamic interpolation grid
-arma::mat createDynamicInterpolationGrid(const arma::mat& rangeData, const arma::mat& heightData, 
-                                        int rows_img, int cols_img) {
-    // Create distance map for each pixel
-    arma::mat distanceMap = arma::zeros(rows_img, cols_img);
-    
-    // Calculate distance for each valid point
-    for (int i = 0; i < rows_img; ++i) {
-        for (int j = 0; j < cols_img; ++j) {
-            if (rangeData(i, j) > 0) {
-                distanceMap(i, j) = rangeData(i, j);
-            }
-        }
-    }
-    
-    // Calculate maximum interpolation factor needed
-    float maxInterpolFactor = 0.0f;
-    for (int i = 0; i < rows_img; ++i) {
-        for (int j = 0; j < cols_img; ++j) {
-            if (distanceMap(i, j) > 0) {
-                float interpol_factor = getDynamicInterpolationFactor(distanceMap(i, j));
-                maxInterpolFactor = std::max(maxInterpolFactor, interpol_factor);
-            }
-        }
-    }
-    
-    // Create interpolation pattern based on distance
-    arma::vec X = arma::regspace(1, cols_img);
-    arma::vec Y = arma::regspace(1, rows_img);
-    arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-    arma::vec YI = arma::regspace(Y.min(), 1.0/maxInterpolFactor, Y.max());
-    
-    return arma::mat(YI.n_elem, XI.n_elem, arma::fill::zeros);
-}
-
-// Enhanced interpolation function with distance-based adaptive interpolation
-// === Replace performDynamicInterpolation() with this improved version ===
-
-void performDynamicInterpolation(arma::mat& ZI, arma::mat& ZzI, const arma::mat& Z, const arma::mat& Zz, int rows_img, int cols_img) {
-    arma::mat ZI_temp = arma::zeros(rows_img, cols_img);
-    arma::mat ZzI_temp = arma::zeros(rows_img, cols_img);
-    arma::mat weight_map = arma::zeros(rows_img, cols_img);
-
-    std::vector<std::pair<float, float>> ranges = {
-        {0.0f, 5.0f}, {5.0f, 10.0f}, {10.0f, 15.0f},
-        {15.0f, 20.0f}, {20.0f, 25.0f}, {25.0f, 100.0f}
-    };
-
-    arma::vec X = arma::regspace(1, cols_img);
-    arma::vec Y = arma::regspace(1, rows_img);
-
-    for (auto& range : ranges) {
-        float d_min = range.first;
-        float d_max = range.second;
-        float interpol_factor = getDynamicInterpolationFactor((d_min + d_max) / 2.0f);
-
-        arma::umat mask = (Z >= d_min) && (Z < d_max);
-
-        if (arma::accu(mask) == 0) continue;  // Skip empty bands
-
-        arma::mat Z_masked = arma::zeros(rows_img, cols_img);
-        arma::mat Zz_masked = arma::zeros(rows_img, cols_img);
-
-        for (int i = 0; i < rows_img; ++i) {
-            for (int j = 0; j < cols_img; ++j) {
-                if (mask(i, j)) {
-                    Z_masked(i, j) = Z(i, j);
-                    Zz_masked(i, j) = Zz(i, j);
-                }
-            }
-        }
-
-        arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-        arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_factor, Y.max());
-
-        arma::mat ZI_local, ZzI_local;
-        arma::interp2(X, Y, Z_masked, XI, YI, ZI_local, "linear");
-        arma::interp2(X, Y, Zz_masked, XI, YI, ZzI_local, "linear");
-
-        for (uint i = 0; i < ZI_local.n_rows && i < rows_img; ++i) {
-            for (uint j = 0; j < ZI_local.n_cols && j < cols_img; ++j) {
-                if (ZI_local(i, j) > 0) {
-                    ZI_temp(i, j) += ZI_local(i, j);
-                    ZzI_temp(i, j) += ZzI_local(i, j);
-                    weight_map(i, j) += 1.0;
-                }
-            }
-        }
-    }
-
-    ZI = arma::zeros(rows_img, cols_img);
-    ZzI = arma::zeros(rows_img, cols_img);
-
-    for (int i = 0; i < rows_img; ++i) {
-        for (int j = 0; j < cols_img; ++j) {
-            if (weight_map(i, j) > 0) {
-                ZI(i, j) = ZI_temp(i, j) / weight_map(i, j);
-                ZzI(i, j) = ZzI_temp(i, j) / weight_map(i, j);
-            }
-        }
-    }
-}
-
 ///////////////////////////////////////callback
+
 void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , const ImageConstPtr& in_image)
 {
     cv_bridge::CvImagePtr cv_ptr , color_pcl;
@@ -235,6 +116,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
   //                                                  point cloud to image 
   //============================================================================================================
+  //============================================================================================================
+
   Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
   rangeImage->pcl::RangeImage::createFromPointCloud(*cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
                                        pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height),
@@ -243,18 +126,20 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
   int cols_img = rangeImage->width;
   int rows_img = rangeImage->height;
 
-  arma::mat Z;  // range image
-  arma::mat Zz; // height image
+  arma::mat Z;  // interpolation de la imagen
+  arma::mat Zz; // interpolation de las alturas de la imagen
 
   Z.zeros(rows_img,cols_img);         
   Zz.zeros(rows_img,cols_img);       
 
+  Eigen::MatrixXf ZZei (rows_img,cols_img);
+ 
   for (int i=0; i< cols_img; ++i)
       for (int j=0; j<rows_img ; ++j)
       {
         float r =  rangeImage->getPoint(i, j).range;     
         float zz = rangeImage->getPoint(i, j).z; 
-       
+
         if(std::isinf(r) || r<minlen || r>maxlen || std::isnan(zz)){
             continue;
         }             
@@ -262,117 +147,217 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         Zz.at(j,i) = zz;
       }
 
-  ////////////////////////////////////////////// DYNAMIC INTERPOLATION
+  ////////////////////////////////////////////// Enhanced interpolation section
   //============================================================================================================
   
-  arma::mat ZI;
-  arma::mat ZzI;
-  
-  // Apply dynamic interpolation based on distance
-  performDynamicInterpolation(ZI, ZzI, Z, Zz, rows_img, cols_img);
+  // VLP-16 specific parameters
+  const int VLP16_LAYERS = 16;
+  const int BASE_INTERPOLATION = 6;  // Starting interpolation lines for first layer
+  const int MAX_INTERPOLATION = 21;  // Maximum interpolation lines for last layer
 
-  //===========================================Enhanced processing=================================================
-  
-  // Handle zeros in interpolation with distance-aware approach
-  arma::mat Zout = ZI;
-  
-  for (uint i = 0; i < ZI.n_rows; i++) {
-      for (uint j = 0; j < ZI.n_cols; j++) {
-          if (ZI(i, j) == 0) {
-              float local_interpol_factor = 6.0f; // Default for unknown distance
+  // Calculate dynamic interpolation value for each layer
+  auto calculateDynamicInterpolation = [](int layer_index, int total_layers) -> float {
+      // Linear increase from BASE_INTERPOLATION to MAX_INTERPOLATION
+      float interpolation_step = (float)(MAX_INTERPOLATION - BASE_INTERPOLATION) / (total_layers - 1);
+      return BASE_INTERPOLATION + (interpolation_step * layer_index);
+  };
+
+  // Create dynamic interpolation matrix
+  arma::mat ZI_dynamic;
+  arma::mat ZzI_dynamic;
+
+  // Calculate total rows needed for dynamic interpolation
+  int total_interpolated_rows = 0;
+  for (int layer = 0; layer < VLP16_LAYERS; layer++) {
+      float layer_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+      if (layer < Z.n_rows) {
+          total_interpolated_rows += (int)layer_interpolation;
+      }
+  }
+
+  // Initialize dynamic interpolation matrices
+  ZI_dynamic.zeros(total_interpolated_rows, Z.n_cols);
+  ZzI_dynamic.zeros(total_interpolated_rows, Z.n_cols);
+
+  // Process each layer with dynamic interpolation
+  int output_row_index = 0;
+  int layer_height = Z.n_rows / VLP16_LAYERS;  // Approximate rows per layer
+
+  for (int layer = 0; layer < VLP16_LAYERS && layer * layer_height < Z.n_rows; layer++) {
+      float current_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+      
+      // Define layer boundaries
+      int layer_start = layer * layer_height;
+      int layer_end = std::min((layer + 1) * layer_height, (int)Z.n_rows);
+      
+      // Extract current layer data
+      arma::mat layer_Z = Z.submat(layer_start, 0, layer_end - 1, Z.n_cols - 1);
+      arma::mat layer_Zz = Zz.submat(layer_start, 0, layer_end - 1, Zz.n_cols - 1);
+      
+      // Create interpolation vectors for this layer
+      arma::vec X_layer = arma::regspace(1, layer_Z.n_cols);
+      arma::vec Y_layer = arma::regspace(1, layer_Z.n_rows);
+      
+      // Dynamic interpolation spacing
+      arma::vec YI_layer = arma::regspace(Y_layer.min(), 1.0/current_interpolation, Y_layer.max());
+      arma::vec XI_layer = arma::regspace(X_layer.min(), 1.0, X_layer.max());
+      
+      // Perform interpolation for this layer
+      arma::mat ZI_layer, ZzI_layer;
+      
+      try {
+          arma::interp2(X_layer, Y_layer, layer_Z, XI_layer, YI_layer, ZI_layer, "linear");
+          arma::interp2(X_layer, Y_layer, layer_Zz, XI_layer, YI_layer, ZzI_layer, "linear");
+          
+          // Insert interpolated layer into dynamic result
+          int layer_rows = ZI_layer.n_rows;
+          int available_rows = std::min(layer_rows, total_interpolated_rows - output_row_index);
+          
+          if (available_rows > 0) {
+              ZI_dynamic.submat(output_row_index, 0, output_row_index + available_rows - 1, ZI_layer.n_cols - 1) = 
+                  ZI_layer.submat(0, 0, available_rows - 1, ZI_layer.n_cols - 1);
               
-              // Find nearest valid point to estimate distance
-              for (int search_radius = 1; search_radius <= 10; search_radius++) {
-                  bool found = false;
-                  for (int di = -search_radius; di <= search_radius && !found; di++) {
-                      for (int dj = -search_radius; dj <= search_radius && !found; dj++) {
-                          int ni = i + di;
-                          int nj = j + dj;
-                          if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols) {
-                              if (ZI(ni, nj) > 0) {
-                                  local_interpol_factor = getDynamicInterpolationFactor(ZI(ni, nj));
-                                  found = true;
-                              }
+              ZzI_dynamic.submat(output_row_index, 0, output_row_index + available_rows - 1, ZzI_layer.n_cols - 1) = 
+                  ZzI_layer.submat(0, 0, available_rows - 1, ZzI_layer.n_cols - 1);
+              
+              output_row_index += available_rows;
+          }
+          
+          // Debug output for layer information
+          ROS_INFO("Layer %d: interpolation=%.1f, rows=%d, output_index=%d", 
+                   layer, current_interpolation, layer_rows, output_row_index);
+          
+      } catch (const std::exception& e) {
+          ROS_WARN("Interpolation failed for layer %d: %s", layer, e.what());
+          continue;
+      }
+  }
+
+  // Replace original interpolation results with dynamic results
+  arma::mat ZI = ZI_dynamic;
+  arma::mat ZzI = ZzI_dynamic;
+
+  // Enhanced zero handling with layer-aware interpolation
+  arma::mat Zout = ZI;
+
+  // Apply layer-aware zero filtering
+  output_row_index = 0;
+  for (int layer = 0; layer < VLP16_LAYERS; layer++) {
+      float current_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+      int layer_rows = (int)current_interpolation * (layer_height > 0 ? layer_height : 1);
+      
+      // Ensure we don't exceed matrix bounds
+      int actual_layer_rows = std::min(layer_rows, (int)ZI.n_rows - output_row_index);
+      if (actual_layer_rows <= 0) break;
+      
+      // Process zeros in this layer
+      for (int i = output_row_index; i < output_row_index + actual_layer_rows; i++) {
+          for (uint j = 0; j < ZI.n_cols; j++) {
+              if (ZI(i, j) == 0) {
+                  int interpolation_range = (int)(current_interpolation * 0.5); // Adaptive range
+                  
+                  // Forward zero propagation
+                  if (i + interpolation_range < ZI.n_rows) {
+                      for (int k = 1; k <= interpolation_range; k++) {
+                          if (i + k < ZI.n_rows) {
+                              Zout(i + k, j) = 0;
                           }
                       }
                   }
-                  if (found) break;
-              }
-              
-              // Apply distance-based zero padding
-              int padding_size = (int)local_interpol_factor;
-              if (i + padding_size < ZI.n_rows) {
-                  for (int k = 1; k <= padding_size; k++) {
-                      Zout(i + k, j) = 0;
-                  }
-              }
-              if (i > padding_size) {
-                  for (int k = 1; k <= padding_size; k++) {
-                      Zout(i - k, j) = 0;
+                  
+                  // Backward zero propagation
+                  if (i > interpolation_range) {
+                      for (int k = 1; k <= interpolation_range; k++) {
+                          if (i - k >= 0) {
+                              Zout(i - k, j) = 0;
+                          }
+                      }
                   }
               }
           }
       }
+      
+      output_row_index += actual_layer_rows;
   }
+
   ZI = Zout;
 
-  // Enhanced adaptive interpolation for missing data
-  for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-      for (uint j = 1; j < ZI.n_cols - 1; ++j) {
-          if (ZI(i, j) == 0) {
-              double weighted_sum = 0.0;
-              double weight_total = 0.0;
-              
-              // Estimate local interpolation factor
-              float local_interpol_factor = 6.0f;
-              for (int search_radius = 1; search_radius <= 5; search_radius++) {
-                  for (int di = -search_radius; di <= search_radius; di++) {
-                      for (int dj = -search_radius; dj <= search_radius; dj++) {
+  // Enhanced adaptive interpolation with layer awareness
+  double base_density_threshold = 0.05;
+  int base_max_window = 9;
+  int base_min_window = 3;
+
+  output_row_index = 0;
+  for (int layer = 0; layer < VLP16_LAYERS; layer++) {
+      float current_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+      int layer_rows = (int)current_interpolation * (layer_height > 0 ? layer_height : 1);
+      
+      // Ensure we don't exceed matrix bounds
+      int actual_layer_rows = std::min(layer_rows, (int)ZI.n_rows - output_row_index);
+      if (actual_layer_rows <= 0) break;
+      
+      // Adaptive parameters based on layer interpolation density
+      double layer_density_threshold = base_density_threshold * (current_interpolation / BASE_INTERPOLATION);
+      int layer_max_window = base_max_window + (int)((current_interpolation - BASE_INTERPOLATION) / 2.0);
+      int layer_min_window = base_min_window;
+      
+      // Process missing data in this layer
+      for (int i = output_row_index + 1; i < output_row_index + actual_layer_rows - 1; i++) {
+          for (uint j = 1; j < ZI.n_cols - 1; j++) {
+              if (ZI(i, j) == 0) {
+                  double weighted_sum = 0.0;
+                  double weight_total = 0.0;
+                  
+                  // Calculate local density
+                  int valid_neighbors = 0;
+                  for (int di = -1; di <= 1; di++) {
+                      for (int dj = -1; dj <= 1; dj++) {
                           int ni = i + di;
                           int nj = j + dj;
-                          if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols) {
-                              if (ZI(ni, nj) > 0) {
-                                  local_interpol_factor = getDynamicInterpolationFactor(ZI(ni, nj));
-                                  goto found_reference;
-                              }
+                          
+                          if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                              valid_neighbors++;
                           }
                       }
                   }
-              }
-              found_reference:
-              
-              // Dynamic window size based on distance
-              int window_size = std::max(3, std::min(9, (int)(local_interpol_factor / 2.0f)));
-              
-              for (int di = -window_size; di <= window_size; ++di) {
-                  for (int dj = -window_size; dj <= window_size; ++dj) {
-                      int ni = i + di;
-                      int nj = j + dj;
-
-                      if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols && ZI(ni, nj) > 0) {
-                          double distance = std::sqrt(di * di + dj * dj);
-                          double weight = 1.0 / (distance + 1e-6);
-                          weighted_sum += ZI(ni, nj) * weight;
-                          weight_total += weight;
+                  
+                  // Determine window size based on layer density
+                  int window_size = (valid_neighbors < layer_density_threshold * 9) ? layer_max_window : layer_min_window;
+                  
+                  // Interpolate using determined window size
+                  for (int di = -window_size; di <= window_size; di++) {
+                      for (int dj = -window_size; dj <= window_size; dj++) {
+                          int ni = i + di;
+                          int nj = j + dj;
+                          
+                          if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                              double distance = std::sqrt(di * di + dj * dj);
+                              double weight = 1.0 / (distance + 1e-6);
+                              weighted_sum += ZI(ni, nj) * weight;
+                              weight_total += weight;
+                          }
                       }
                   }
-              }
-
-              if (weight_total > 0) {
-                  ZI(i, j) = weighted_sum / weight_total;
+                  
+                  if (weight_total > 0) {
+                      ZI(i, j) = weighted_sum / weight_total;
+                  }
               }
           }
       }
+      
+      output_row_index += actual_layer_rows;
   }
 
-  // Enhanced edge preservation with distance-based thresholding
+  // Enhanced edge preservation with layer-specific thresholds
   arma::mat Zenhanced = ZI;
   arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
   arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
   arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
 
-  for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-      for (uint j = 1; j < ZI.n_cols - 1; ++j) {
+  // Calculate gradients with layer awareness
+  for (uint i = 1; i < ZI.n_rows - 1; i++) {
+      for (uint j = 1; j < ZI.n_cols - 1; j++) {
           if (ZI(i, j) > 0) {
               grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
               grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
@@ -381,71 +366,96 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
       }
   }
 
+  // Apply layer-specific edge preservation
   double base_edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
+  output_row_index = 0;
 
-  for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-      for (uint j = 1; j < ZI.n_cols - 1; ++j) {
-          if (ZI(i, j) > 0) {
-              // Distance-based edge threshold
-              float distance = ZI(i, j);
-              float interpol_factor = getDynamicInterpolationFactor(distance);
-              double edge_threshold = base_edge_threshold * (interpol_factor / 6.0f);
-              
-              if (grad_mag(i, j) > edge_threshold) {
-                  double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
+  for (int layer = 0; layer < VLP16_LAYERS; layer++) {
+      float current_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+      int layer_rows = (int)current_interpolation * (layer_height > 0 ? layer_height : 1);
+      
+      // Ensure we don't exceed matrix bounds
+      int actual_layer_rows = std::min(layer_rows, (int)ZI.n_rows - output_row_index);
+      if (actual_layer_rows <= 0) break;
+      
+      // Layer-specific edge threshold
+      double layer_edge_threshold = base_edge_threshold * (current_interpolation / BASE_INTERPOLATION);
+      
+      for (int i = output_row_index + 1; i < output_row_index + actual_layer_rows - 1; i++) {
+          for (uint j = 1; j < ZI.n_cols - 1; j++) {
+              if (grad_mag(i, j) > layer_edge_threshold) {
+                  double weight = std::max(0.0, 1.0 - grad_mag(i, j) / layer_edge_threshold);
                   Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
               }
           }
       }
+      
+      output_row_index += actual_layer_rows;
   }
 
+  // Replace with enhanced result
   ZI = Zenhanced;
 
-  if (f_pc){    
-      // Distance-based variance filtering
-      for (uint i=0; i< ZI.n_rows; i+=1) {
-          for (uint j=0; j<ZI.n_cols-5 ; j+=1) {
-              if (ZI(i, j) > 0) {
-                  float distance = ZI(i, j);
-                  float local_interpol_factor = getDynamicInterpolationFactor(distance);
-                  int filter_window = std::max(1, (int)(local_interpol_factor / 3.0f));
-                  
+  // Update variance filtering to work with dynamic interpolation
+  if (f_pc) {
+      arma::mat Zout_var = ZI;
+      output_row_index = 0;
+      
+      for (int layer = 0; layer < VLP16_LAYERS; layer++) {
+          float current_interpolation = calculateDynamicInterpolation(layer, VLP16_LAYERS);
+          int layer_rows = (int)current_interpolation * (layer_height > 0 ? layer_height : 1);
+          
+          // Ensure we don't exceed matrix bounds
+          int actual_layer_rows = std::min(layer_rows, (int)ZI.n_rows - output_row_index);
+          if (actual_layer_rows <= 0) break;
+          
+          // Process variance filtering for this layer
+          for (int i = output_row_index; i < output_row_index + actual_layer_rows - (int)current_interpolation; i += 1) {
+              for (uint j = 0; j < ZI.n_cols - 5; j += 1) {
                   double promedio = 0;
                   double varianza = 0;
-                  int valid_count = 0;
                   
-                  for (int k = 0; k < filter_window && (i + k) < ZI.n_rows; k++) {
-                      if (ZI(i + k, j) > 0) {
+                  // Calculate average using current layer's interpolation
+                  for (int k = 0; k < (int)current_interpolation; k += 1) {
+                      if (i + k < ZI.n_rows) {
                           promedio += ZI(i + k, j);
-                          valid_count++;
+                      }
+                  }
+                  promedio /= current_interpolation;
+                  
+                  // Calculate variance
+                  for (int l = 0; l < (int)current_interpolation; l++) {
+                      if (i + l < ZI.n_rows) {
+                          varianza += pow((ZI(i + l, j) - promedio), 2.0);
                       }
                   }
                   
-                  if (valid_count > 0) {
-                      promedio = promedio / valid_count;
-                      
-                      for (int l = 0; l < filter_window && (i + l) < ZI.n_rows; l++) {
-                          if (ZI(i + l, j) > 0) {
-                              varianza += pow((ZI(i + l, j) - promedio), 2.0);
-                          }
-                      }
-                      
-                      // Distance-based variance threshold
-                      double distance_var_threshold = max_var * (local_interpol_factor / 6.0f);
-                      
-                      if (varianza > distance_var_threshold) {
-                          for (int m = 0; m < filter_window && (i + m) < ZI.n_rows; m++) {
-                              Zout(i + m, j) = 0;
+                  // Apply variance threshold (adjusted for layer density)
+                  double layer_max_var = max_var * (current_interpolation / BASE_INTERPOLATION);
+                  if (varianza > layer_max_var) {
+                      for (int m = 0; m < (int)current_interpolation; m++) {
+                          if (i + m < ZI.n_rows) {
+                              Zout_var(i + m, j) = 0;
                           }
                       }
                   }
               }
           }
+          
+          output_row_index += actual_layer_rows;
       }
-      ZI = Zout;
+      
+      ZI = Zout_var;
   }
 
-  ///////// Range image to point cloud with distance-aware processing
+  // Dynamic interpolation complete
+  ROS_INFO("Dynamic interpolation complete. Total rows: %d", (int)ZI.n_rows);
+
+  //===========================================fin filtrado por imagen=================================================
+
+  // reconstruccion de imagen a nube 3D
+  //============================================================================================================
+
   PointCloud::Ptr point_cloud (new PointCloud);
   PointCloud::Ptr cloud (new PointCloud);
   point_cloud->width = ZI.n_cols; 
@@ -453,40 +463,45 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
   point_cloud->is_dense = false;
   point_cloud->points.resize (point_cloud->width * point_cloud->height);
 
+  ///////// imagen de rango a nube de puntos  
   int num_pc = 0; 
-  for (uint i=0; i< ZI.n_rows; i+=1) {       
-      for (uint j=0; j<ZI.n_cols ; j+=1) {
-          float ang = M_PI-((2.0 * M_PI * j )/(ZI.n_cols));
+  for (uint i=0; i< ZI.n_rows - interpol_value; i+=1)
+   {       
+      for (uint j=0; j<ZI.n_cols ; j+=1)
+      {
+        float ang = M_PI-((2.0 * M_PI * j )/(ZI.n_cols));
 
-          if (ang < min_FOV-M_PI/2.0|| ang > max_FOV - M_PI/2.0) 
-            continue;
+        if (ang < min_FOV-M_PI/2.0|| ang > max_FOV - M_PI/2.0) 
+          continue;
 
-          if(!(Zout(i,j)== 0 )) {  
-            float pc_modulo = Zout(i,j);
-            float pc_x = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * cos(ang);
-            float pc_y = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * sin(ang);
+        if(!(ZI(i,j)== 0 ))
+        {  
+          float pc_modulo = ZI(i,j);
+          float pc_x = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * cos(ang);
+          float pc_y = sqrt(pow(pc_modulo,2)- pow(ZzI(i,j),2)) * sin(ang);
 
-            float ang_x_lidar = 0.6*M_PI/180.0;  
+          float ang_x_lidar = 0.6*M_PI/180.0;  
 
-            Eigen::MatrixXf Lidar_matrix(3,3);
-            Eigen::MatrixXf result(3,1);
-            Lidar_matrix <<   cos(ang_x_lidar) ,0                ,sin(ang_x_lidar),
-                              0                ,1                ,0,
-                              -sin(ang_x_lidar),0                ,cos(ang_x_lidar) ;
+          Eigen::MatrixXf Lidar_matrix(3,3); //matrix  transformation between lidar and range image. It rotates the angles that it has of error with respect to the ground
+          Eigen::MatrixXf result(3,1);
+          Lidar_matrix <<   cos(ang_x_lidar) ,0                ,sin(ang_x_lidar),
+                            0                ,1                ,0,
+                            -sin(ang_x_lidar),0                ,cos(ang_x_lidar) ;
 
-            result << pc_x,
-                      pc_y,
-                      ZzI(i,j);
-            
-            result = Lidar_matrix*result;
+          result << pc_x,
+                    pc_y,
+                    ZzI(i,j);
+          
+          result = Lidar_matrix*result;  // rotacion en eje X para correccion
 
-            point_cloud->points[num_pc].x = result(0);
-            point_cloud->points[num_pc].y = result(1);
-            point_cloud->points[num_pc].z = result(2);
+          point_cloud->points[num_pc].x = result(0);
+          point_cloud->points[num_pc].y = result(1);
+          point_cloud->points[num_pc].z = result(2);
 
-            cloud->push_back(point_cloud->points[num_pc]); 
-            num_pc++;
-          }
+          cloud->push_back(point_cloud->points[num_pc]); 
+
+          num_pc++;
+        }
       }
    }  
 
@@ -495,74 +510,77 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
    PointCloud::Ptr P_out (new PointCloud);
    P_out = cloud;
 
-   // Rest of the code remains the same...
-   Eigen::MatrixXf RTlc(4,4);
-   RTlc<<   Rlc(0), Rlc(3) , Rlc(6) ,Tlc(0)
-           ,Rlc(1), Rlc(4) , Rlc(7) ,Tlc(1)
-           ,Rlc(2), Rlc(5) , Rlc(8) ,Tlc(2)
-           ,0       , 0        , 0  , 1    ;
+  Eigen::MatrixXf RTlc(4,4); // translation matrix lidar-camera
+  RTlc<<   Rlc(0), Rlc(3) , Rlc(6) ,Tlc(0)
+          ,Rlc(1), Rlc(4) , Rlc(7) ,Tlc(1)
+          ,Rlc(2), Rlc(5) , Rlc(8) ,Tlc(2)
+          ,0       , 0        , 0  , 1    ;
 
-   int size_inter_Lidar = (int) P_out->points.size();
-   Eigen::MatrixXf Lidar_camera(3,size_inter_Lidar);
-   Eigen::MatrixXf Lidar_cam(3,1);
-   Eigen::MatrixXf pc_matrix(4,1);
-   Eigen::MatrixXf pointCloud_matrix(4,size_inter_Lidar);
+  int size_inter_Lidar = (int) P_out->points.size();
 
-   unsigned int cols = in_image->width;
-   unsigned int rows = in_image->height;
+  Eigen::MatrixXf Lidar_camera(3,size_inter_Lidar);
+  Eigen::MatrixXf Lidar_cam(3,1);
+  Eigen::MatrixXf pc_matrix(4,1);
+  Eigen::MatrixXf pointCloud_matrix(4,size_inter_Lidar);
 
-   uint px_data = 0; uint py_data = 0;
-   pcl::PointXYZRGB point;
-   pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color (new pcl::PointCloud<pcl::PointXYZRGB>);
+  unsigned int cols = in_image->width;
+  unsigned int rows = in_image->height;
 
-   for (int i = 0; i < size_inter_Lidar; i++) {
-       pc_matrix(0,0) = -P_out->points[i].y;   
-       pc_matrix(1,0) = -P_out->points[i].z;   
-       pc_matrix(2,0) =  P_out->points[i].x;  
-       pc_matrix(3,0) = 1.0;
+  uint px_data = 0; uint py_data = 0;
 
-       Lidar_cam = Mc * (RTlc * pc_matrix);
+  pcl::PointXYZRGB point;
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color (new pcl::PointCloud<pcl::PointXYZRGB>);
 
-       px_data = (int)(Lidar_cam(0,0)/Lidar_cam(2,0));
-       py_data = (int)(Lidar_cam(1,0)/Lidar_cam(2,0));
-       
-       if(px_data<0.0 || px_data>=cols || py_data<0.0 || py_data>=rows)
-           continue;
+  for (int i = 0; i < size_inter_Lidar; i++)
+  {
+      pc_matrix(0,0) = -P_out->points[i].y;   
+      pc_matrix(1,0) = -P_out->points[i].z;   
+      pc_matrix(2,0) =  P_out->points[i].x;  
+      pc_matrix(3,0) = 1.0;
 
-       int color_dis_x = (int)(255*((P_out->points[i].x)/maxlen));
-       int color_dis_z = (int)(255*((P_out->points[i].x)/10.0));
-       if(color_dis_z>255)
-           color_dis_z = 255;
+      Lidar_cam = Mc * (RTlc * pc_matrix);
 
-       cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data,px_data);
+      px_data = (int)(Lidar_cam(0,0)/Lidar_cam(2,0));
+      py_data = (int)(Lidar_cam(1,0)/Lidar_cam(2,0));
+      
+      if(px_data<0.0 || px_data>=cols || py_data<0.0 || py_data>=rows)
+          continue;
 
-       point.x = P_out->points[i].x;
-       point.y = P_out->points[i].y;
-       point.z = P_out->points[i].z;
-       
-       point.r = (int)color[2]; 
-       point.g = (int)color[1]; 
-       point.b = (int)color[0];
-       
-       pc_color->points.push_back(point);   
-       
-       cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255-color_dis_x,(int)(color_dis_z),color_dis_x),cv::FILLED);
-   }
-   
-   pc_color->is_dense = true;
-   pc_color->width = (int) pc_color->points.size();
-   pc_color->height = 1;
-   pc_color->header.frame_id = "velodyne";
+      int color_dis_x = (int)(255*((P_out->points[i].x)/maxlen));
+      int color_dis_z = (int)(255*((P_out->points[i].x)/10.0));
+      if(color_dis_z>255)
+          color_dis_z = 255;
 
-   pcOnimg_pub.publish(cv_ptr->toImageMsg());
-   pc_pub.publish (pc_color);
+      //point cloud con color
+      cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data,px_data);
+
+      point.x = P_out->points[i].x;
+      point.y = P_out->points[i].y;
+      point.z = P_out->points[i].z;
+      
+      point.r = (int)color[2]; 
+      point.g = (int)color[1]; 
+      point.b = (int)color[0];
+      
+      pc_color->points.push_back(point);   
+      
+      cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255-color_dis_x,(int)(color_dis_z),color_dis_x),cv::FILLED);
+  }
+  
+  pc_color->is_dense = true;
+  pc_color->width = (int) pc_color->points.size();
+  pc_color->height = 1;
+  pc_color->header.frame_id = "velodyne";
+
+  pcOnimg_pub.publish(cv_ptr->toImageMsg());
+  pc_pub.publish (pc_color);
 }
 
 int main(int argc, char** argv)
 {
   ros::init(argc, argv, "pontCloudOntImage");
   ros::NodeHandle nh;  
-  
+
   /// Load Parameters
   nh.getParam("/maxlen", maxlen);
   nh.getParam("/minlen", minlen);
@@ -572,10 +590,11 @@ int main(int argc, char** argv)
   nh.getParam("/imgTopic", imgTopic);
   nh.getParam("/max_var", max_var);  
   nh.getParam("/filter_output_pc", f_pc);
+
   nh.getParam("/x_resolution", angular_resolution_x);
   nh.getParam("/y_interpolation", interpol_value);
   nh.getParam("/ang_Y_resolution", angular_resolution_y);
-  
+
   XmlRpc::XmlRpcValue param;
 
   nh.getParam("/matrix_file/tlc", param);
@@ -584,6 +603,7 @@ int main(int argc, char** argv)
          ,(double)param[2];
 
   nh.getParam("/matrix_file/rlc", param);
+
   Rlc <<  (double)param[0] ,(double)param[1] ,(double)param[2]
          ,(double)param[3] ,(double)param[4] ,(double)param[5]
          ,(double)param[6] ,(double)param[7] ,(double)param[8];
