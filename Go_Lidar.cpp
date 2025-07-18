@@ -58,7 +58,7 @@ float max_depth = 100.0;
 float min_depth = 8.0;
 double max_var = 50.0; 
 
-float interpol_value = 20.0; // Base interpolation value, will be overridden for dynamic interpolation
+float interpol_value = 20.0; // Base interpolation value, overridden for dynamic interpolation
 
 bool f_pc = true; 
 
@@ -145,13 +145,14 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     }
 
     ////////////////////////////////////////////// dynamic interpolation
-    // VLP-16 has 16 layers, vertical FOV is typically -15 to +15 degrees (30 degrees total)
-    // We'll map rows to layers and apply increasing interpolation density
+    // VLP-16 has 16 layers, vertical FOV from -15 to +15 degrees (30 degrees total)
     const int num_layers = 16;
     const float vlp16_fov = 30.0f; // degrees, -15 to +15
     const float deg_per_layer = vlp16_fov / num_layers; // 1.875 degrees per layer
     const int base_lines = 6; // Starting number of interpolated lines for first layer
     const int max_lines = 21; // Maximum number of interpolated lines for last layer
+    const float vlp16_min_angle = -15.0f; // Minimum vertical angle in degrees
+    const float vlp16_max_angle = 15.0f;  // Maximum vertical angle in degrees
 
     arma::vec X = arma::regspace(1, cols_img);  // X = horizontal spacing
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); // Same horizontal resolution
@@ -162,8 +163,26 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     ZI.zeros();
     ZzI.zeros();
 
-    // Calculate rows per layer
-    int rows_per_layer = rows_img / num_layers; // Approximate rows per layer
+    // Map VLP-16 angles to rows
+    std::vector<float> vlp16_angles = {
+        -0.261799, -0.226893, -0.191986, -0.157080, -0.122173, -0.087266, -0.052360, -0.017453,
+        0.017453, 0.052360, 0.087266, 0.122173, 0.157080, 0.191986, 0.226893, 0.261799
+    }; // Radians, from log output
+
+    // Convert angles to row indices
+    std::vector<int> row_indices(num_layers);
+    for (int i = 0; i < num_layers; ++i)
+    {
+        // Map angle to row index: rangeImage maps [0, rows_img-1] to [max_angle_height/2, -max_angle_height/2]
+        float angle_deg = vlp16_angles[i] * 180.0f / M_PI; // Convert to degrees
+        // Normalize angle to [0, 1] within the range image's vertical FOV
+        float normalized = (vlp16_max_angle - angle_deg) / (vlp16_max_angle - vlp16_min_angle);
+        row_indices[i] = std::round(normalized * (rows_img - 1));
+    }
+
+    // Ensure row indices are sorted and unique
+    std::sort(row_indices.begin(), row_indices.end());
+    row_indices.erase(std::unique(row_indices.begin(), row_indices.end()), row_indices.end());
 
     // Interpolate each layer with increasing density
     int current_row_output = 0;
@@ -174,34 +193,61 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         float interpol_step = 1.0f / num_lines;
 
         // Define row range for this layer
-        int row_start = layer * rows_per_layer;
-        int row_end = (layer + 1) * rows_per_layer;
-        if (layer == num_layers - 1) row_end = rows_img; // Ensure last layer includes all remaining rows
+        int row_start = (layer == 0) ? 0 : row_indices[layer - 1];
+        int row_end = (layer == num_layers - 1) ? rows_img : row_indices[layer];
+        if (row_end <= row_start + 1) // Ensure at least 2 rows for interpolation
+        {
+            row_end = row_start + 2; // Minimum size to avoid interp2 error
+            if (row_end > rows_img) row_end = rows_img;
+        }
 
         // Extract submatrix for this layer
         arma::mat Z_layer = Z.rows(row_start, row_end - 1);
         arma::mat Zz_layer = Zz.rows(row_start, row_end - 1);
         arma::vec Y_layer = arma::regspace(row_start + 1, row_end);
+
+        // Ensure Y_layer has at least two unique elements
+        if (Y_layer.n_elem < 2)
+        {
+            Y_layer = arma::vec({static_cast<double>(row_start + 1), static_cast<double>(row_end)});
+        }
+
         arma::vec YI_layer = arma::regspace(Y_layer.min(), interpol_step, Y_layer.max());
 
         // Interpolate this layer
         arma::mat ZI_layer, ZzI_layer;
-        arma::interp2(X, Y_layer, Z_layer, XI, YI_layer, ZI_layer, "linear");
-        arma::interp2(X, Y_layer, Zz_layer, XI, YI_layer, ZzI_layer, "linear");
+        try
+        {
+            arma::interp2(X, Y_layer, Z_layer, XI, YI_layer, ZI_layer, "linear");
+            arma::interp2(X, Y_layer, Zz_layer, XI, YI_layer, ZzI_layer, "linear");
+        }
+        catch (const std::exception& e)
+        {
+            ROS_ERROR("Interpolation error in layer %d: %s", layer, e.what());
+            continue; // Skip this layer to prevent crash
+        }
 
         // Copy interpolated data to output matrices
         for (uint i = 0; i < ZI_layer.n_rows; ++i)
         {
             for (uint j = 0; j < ZI_layer.n_cols; ++j)
             {
-                ZI(current_row_output + i, j) = ZI_layer(i, j);
-                ZzI(current_row_output + i, j) = ZzI_layer(i, j);
+                if (current_row_output + i < ZI.n_rows)
+                {
+                    ZI(current_row_output + i, j) = ZI_layer(i, j);
+                    ZzI(current_row_output + i, j) = ZzI_layer(i, j);
+                }
             }
         }
         current_row_output += ZI_layer.n_rows;
     }
 
     // Resize ZI and ZzI to actual output size
+    if (current_row_output == 0)
+    {
+        ROS_ERROR("No valid interpolated rows produced. Check range image configuration.");
+        return;
+    }
     ZI = ZI.rows(0, current_row_output - 1);
     ZzI = ZzI.rows(0, current_row_output - 1);
 
@@ -325,18 +371,27 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
                 double varianza = 0;
                 for (uint k = 0; k < num_layers ; k += 1)
                 {
-                    promedio = promedio + ZI((i * num_layers) + k, j);
+                    if ((i * num_layers) + k < ZI.n_rows)
+                    {
+                        promedio += ZI((i * num_layers) + k, j);
+                    }
                 }
                 promedio = promedio / num_layers;    
                 for (uint l = 0; l < num_layers; l++) 
                 {
-                    varianza = varianza + pow((ZI((i * num_layers) + l, j) - promedio), 2.0);  
+                    if ((i * num_layers) + l < ZI.n_rows)
+                    {
+                        varianza += pow((ZI((i * num_layers) + l, j) - promedio), 2.0);  
+                    }
                 }
                 if (varianza > max_var)
                 {
                     for (uint m = 0; m < num_layers; m++) 
                     {
-                        Zout((i * num_layers) + m, j) = 0;                 
+                        if ((i * num_layers) + m < ZI.n_rows)
+                        {
+                            Zout((i * num_layers) + m, j) = 0;                 
+                        }
                     }
                 }   
             }
