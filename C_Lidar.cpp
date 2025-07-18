@@ -3,6 +3,7 @@
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <cv_bridge/cv_bridge.h>
 #include <pcl_ros/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -12,6 +13,11 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <armadillo>
 
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
 using namespace std;
 typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 
@@ -20,9 +26,8 @@ ros::Publisher pc_pub;
 float maxlen = 100.0, minlen = 0.01;
 int num_layers = 16, base_interp = 6, max_interp = 21;
 
-// Helper: Dynamic interpolation count
 int dynamic_interp_lines(int layer) {
-    return base_interp + layer; // Simple linear mapping
+    return base_interp + layer;
 }
 
 arma::mat dynamic_interpolate(const arma::mat& Z, int rows_img, int cols_img) {
@@ -51,7 +56,7 @@ arma::mat dynamic_interpolate(const arma::mat& Z, int rows_img, int cols_img) {
         } catch (...) { continue; }
 
         int rows_to_copy = ZI_layer.n_rows;
-        if (current_output + rows_to_copy > ZI.n_rows) break;
+        if ((int)(current_output + rows_to_copy) > (int)ZI.n_rows) break;
 
         ZI.submat(current_output, 0, current_output + rows_to_copy - 1, cols_img - 1) = ZI_layer;
         current_output += rows_to_copy;
@@ -70,7 +75,6 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& in_pc2, const sensor_msgs:
     PointCloud::Ptr cloud(new PointCloud);
     pcl::fromPCLPointCloud2(pcl_pc2, *cloud);
 
-    // Filter NaNs and invalid distances
     PointCloud::Ptr filtered(new PointCloud);
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*cloud, *filtered, indices);
@@ -82,13 +86,12 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& in_pc2, const sensor_msgs:
 
     if (cloud->empty()) return;
 
-    // Convert to range image
-    int cols_img = 180; // horizontal
-    int rows_img = 16;  // vertical
+    int cols_img = 180;
+    int rows_img = 16;
     arma::mat Z(rows_img, cols_img, arma::fill::zeros);
 
     for (auto& pt : cloud->points) {
-        int row = static_cast<int>((pt.z + 15.0) / 2.0); // Approx. VLP-16 row index
+        int row = static_cast<int>((pt.z + 15.0) / 2.0);
         int col = static_cast<int>((atan2(pt.y, pt.x) + M_PI) / (2 * M_PI) * cols_img);
         if (row >= 0 && row < rows_img && col >= 0 && col < cols_img) {
             Z(row, col) = sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
@@ -97,7 +100,6 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& in_pc2, const sensor_msgs:
 
     arma::mat ZI = dynamic_interpolate(Z, rows_img, cols_img);
 
-    // Generate PointCloud from interpolated ZI
     PointCloud::Ptr out_pc(new PointCloud);
     for (size_t i = 0; i < ZI.n_rows; ++i) {
         for (size_t j = 0; j < ZI.n_cols; ++j) {
@@ -107,7 +109,7 @@ void callback(const sensor_msgs::PointCloud2ConstPtr& in_pc2, const sensor_msgs:
                 pcl::PointXYZI p;
                 p.x = cos(angle) * range;
                 p.y = sin(angle) * range;
-                p.z = -15.0f + 2.0f * i; // pseudo elevation for demo
+                p.z = -15.0f + 2.0f * i;
                 p.intensity = range;
                 out_pc->points.push_back(p);
             }
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
     ros::NodeHandle nh;
 
     pc_pub = nh.advertise<PointCloud>("/interpolated_points", 1);
+
     message_filters::Subscriber<sensor_msgs::PointCloud2> pc_sub(nh, "/velodyne_points", 1);
     message_filters::Subscriber<sensor_msgs::Image> img_sub(nh, "/camera/color/image_raw", 1);
 
