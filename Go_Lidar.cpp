@@ -147,137 +147,288 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         }
     }
 
-    ////////////////////////////////////////////// FIXED dynamic interpolation
+    ////////////////////////////////////////////// dynamic interpolation
     // VLP-16 has 16 layers, vertical FOV from -15 to +15 degrees (30 degrees total)
-    const int num_layers = 8;  // Reduced to work better with available rows
+    const int num_layers = 16;
     const float vlp16_min_angle = -15.0f; // Minimum vertical angle in degrees
     const float vlp16_max_angle = 15.0f;  // Maximum vertical angle in degrees
-    
-    // Calculate interpolation factor based on available rows
-    int target_rows = std::max(32, rows_img * 3); // Target at least 32 rows or 3x input
-    double interpolation_factor = static_cast<double>(target_rows) / rows_img;
-    
-    arma::vec X = arma::regspace(0, cols_img - 1);  // 0-based indexing
-    arma::vec XI = arma::regspace(0, 1.0, cols_img - 1); // Same horizontal resolution
-    arma::vec Y = arma::regspace(0, rows_img - 1);  // Original row indices
-    
-    // Create interpolated Y coordinates with higher density
-    double step = 1.0 / interpolation_factor;
-    arma::vec YI = arma::regspace(0, step, rows_img - 1);
-    
-    ROS_INFO("Interpolation setup: original rows=%d, target rows=%zu, step=%.3f", 
-             rows_img, static_cast<size_t>(YI.n_elem), step);
-    
-    // Perform 2D interpolation
-    arma::mat ZI, ZzI;
-    try 
+    const int base_lines = 6; // Starting number of interpolated lines for first layer
+    const int max_lines = 21; // Maximum number of interpolated lines for last layer
+
+    // VLP-16 vertical angles from log (in radians)
+    std::vector<float> vlp16_angles = {
+        -0.261799, -0.226893, -0.191986, -0.157080, -0.122173, -0.087266, -0.052360, -0.017453,
+        0.017453, 0.052360, 0.087266, 0.122173, 0.157080, 0.191986, 0.226893, 0.261799
+    };
+
+    arma::vec X = arma::regspace(1, cols_img);  // X = horizontal spacing
+    arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); // Same horizontal resolution
+
+    // Estimate maximum output rows
+    int max_output_rows = 0;
+    for (int layer = 0; layer < num_layers; ++layer)
     {
-        // Check if we have sufficient data for interpolation
-        if (Y.n_elem >= 2 && X.n_elem >= 2)
-        {
-            arma::interp2(X, Y, Z, XI, YI, ZI, "linear", 0.0);  // Use 0.0 for extrapolation
-            arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear", 0.0);
-            ROS_INFO("Interpolation successful: ZI size = %zu x %zu", 
-                     static_cast<size_t>(ZI.n_rows), static_cast<size_t>(ZI.n_cols));
-        }
-        else
-        {
-            ROS_WARN("Insufficient data for interpolation, using original data");
-            ZI = Z;
-            ZzI = Zz;
-        }
+        max_output_rows += (base_lines + layer) * 2; // Conservative estimate
     }
-    catch (const std::exception& e)
+    arma::mat ZI(max_output_rows, cols_img); // Max size
+    arma::mat ZzI(max_output_rows, cols_img);
+    ZI.zeros();
+    ZzI.zeros();
+
+    // Map angles to row indices
+    std::vector<int> row_indices(num_layers + 1);
+    for (int i = 0; i < num_layers; ++i)
     {
-        ROS_ERROR("Global interpolation failed: %s", e.what());
-        ROS_WARN("Using original range image data");
-        ZI = Z;
-        ZzI = Zz;
+        float angle_deg = vlp16_angles[i] * 180.0f / M_PI;
+        float normalized = (vlp16_max_angle - angle_deg) / (vlp16_max_angle - vlp16_min_angle);
+        row_indices[i] = std::round(normalized * (rows_img - 1));
+    }
+    row_indices[num_layers] = rows_img;
+
+    // Ensure unique and sorted indices
+    std::sort(row_indices.begin(), row_indices.end());
+    auto last = std::unique(row_indices.begin(), row_indices.end());
+    row_indices.erase(last, row_indices.end());
+
+    // Fallback to uniform division if insufficient indices
+    if (row_indices.size() <= static_cast<size_t>(num_layers))
+    {
+        ROS_WARN("Insufficient unique row indices (%zu), expected %d. Using uniform division.", row_indices.size(), num_layers + 1);
+        row_indices.resize(num_layers + 1);
+        int rows_per_layer = std::max(2, rows_img / num_layers); // Ensure at least 2 rows
+        for (int i = 0; i <= num_layers; ++i)
+        {
+            row_indices[i] = i * rows_per_layer;
+            if (row_indices[i] >= rows_img) row_indices[i] = rows_img - 1;
+        }
+        row_indices[num_layers] = rows_img;
     }
 
-    // Handle zeros in interpolation with improved method
-    arma::mat Zout = ZI;
-    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
+    // Interpolate each layer with increasing density
+    int current_row_output = 0;
+    for (int layer = 0; layer < num_layers; ++layer)
     {
-        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
+        int num_lines = base_lines + layer; // 6, 7, ..., 21
+        float interpol_step = 1.0f / num_lines;
+
+        int row_start = row_indices[layer];
+        int row_end = row_indices[layer + 1];
+        if (row_end <= row_start + 1)
+        {
+            row_end = row_start + 2;
+            if (row_end > rows_img) row_end = rows_img;
+        }
+
+        arma::mat Z_layer = Z.rows(row_start, row_end - 1);
+        arma::mat Zz_layer = Zz.rows(row_start, row_end - 1);
+        arma::vec Y_layer = arma::regspace(row_start + 1, row_end);
+
+        if (Y_layer.n_elem < 2)
+        {
+            Y_layer = arma::vec({static_cast<double>(row_start + 1), static_cast<double>(row_end)});
+        }
+
+        arma::vec YI_layer = arma::regspace(Y_layer.min(), interpol_step, Y_layer.max());
+        int expected_rows = std::ceil((row_end - row_start) * num_lines);
+        if (YI_layer.n_elem > static_cast<arma::uword>(expected_rows))
+        {
+            YI_layer = YI_layer.subvec(0, expected_rows - 1);
+        }
+
+        ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%zu, YI_layer.size=%zu",
+                 layer, row_start, row_end - 1, num_lines, static_cast<size_t>(Y_layer.n_elem), static_cast<size_t>(YI_layer.n_elem));
+
+        arma::mat ZI_layer, ZzI_layer;
+        try
+        {
+            arma::interp2(X, Y_layer, Z_layer, XI, YI_layer, ZI_layer, "linear");
+            arma::interp2(X, Y_layer, Zz_layer, XI, YI_layer, ZzI_layer, "linear");
+        }
+        catch (const std::exception& e)
+        {
+            ROS_ERROR("Interpolation error in layer %d: %s", layer, e.what());
+            continue;
+        }
+
+        // Copy to output matrices
+        for (arma::uword i = 0; i < ZI_layer.n_rows && current_row_output + static_cast<int>(i) < max_output_rows; ++i)
+        {
+            for (arma::uword j = 0; j < ZI_layer.n_cols && static_cast<int>(j) < cols_img; ++j)
+            {
+                ZI(current_row_output + i, j) = ZI_layer(i, j);
+                ZzI(current_row_output + i, j) = ZzI_layer(i, j);
+            }
+        }
+        current_row_output += ZI_layer.n_rows;
+    }
+
+    if (current_row_output == 0)
+    {
+        ROS_ERROR("No valid interpolated rows produced. Check range image configuration.");
+        return;
+    }
+    ZI = ZI.rows(0, current_row_output - 1);
+    ZzI = ZzI.rows(0, current_row_output - 1);
+    ROS_INFO("Interpolated output: ZI.rows=%zu, ZI.cols=%zu", static_cast<size_t>(ZI.n_rows), static_cast<size_t>(ZI.n_cols));
+
+    // Handle zeros in interpolation
+    arma::mat Zout = ZI;
+    for (arma::uword i = 0; i < ZI.n_rows; i++)
+    {
+        for (arma::uword j = 0; j < ZI.n_cols; j++)
         {
             if (ZI(i, j) == 0)
             {
-                // Simple averaging from valid neighbors
-                double sum = 0.0;
-                int count = 0;
-                for (int di = -1; di <= 1; ++di)
+                if (i + static_cast<arma::uword>(num_layers) < ZI.n_rows)
                 {
-                    for (int dj = -1; dj <= 1; ++dj)
+                    for (int k = 1; k <= num_layers; k++)
                     {
-                        if (di == 0 && dj == 0) continue;
-                        arma::uword ni = i + di;
-                        arma::uword nj = j + dj;
-                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0)
-                        {
-                            sum += ZI(ni, nj);
-                            count++;
-                        }
+                        Zout(i + k, j) = 0;
                     }
                 }
-                if (count >= 3) // Only fill if we have enough neighbors
+                if (i > static_cast<arma::uword>(num_layers))
                 {
-                    Zout(i, j) = sum / count;
+                    for (int k = 1; k <= num_layers; k++)
+                    {
+                        Zout(i - k, j) = 0;
+                    }
                 }
             }
         }
     }
     ZI = Zout;
 
-    // Variance-based filtering (simplified)
-    if (f_pc && ZI.n_rows > 4)
+    // Determine data density threshold
+    double density_threshold = 0.05;
+    int max_window_size = 9;
+    int min_window_size = 3;
+
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
     {
-        int layer_height = std::max(2, static_cast<int>(ZI.n_rows) / num_layers);
-        
-        for (arma::uword i = 0; i < ZI.n_rows - static_cast<arma::uword>(layer_height); i += layer_height)
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
         {
-            for (arma::uword j = 0; j < ZI.n_cols; ++j)
+            if (ZI(i, j) == 0)
             {
-                double sum = 0.0;
-                int valid_count = 0;
-                
-                // Calculate mean
-                for (int k = 0; k < layer_height && (i + k) < ZI.n_rows; ++k)
+                double weighted_sum = 0.0;
+                double weight_total = 0.0;
+                int valid_neighbors = 0;
+                for (int di = -1; di <= 1; ++di)
                 {
-                    if (ZI(i + k, j) > 0)
+                    for (int dj = -1; dj <= 1; ++dj)
                     {
-                        sum += ZI(i + k, j);
-                        valid_count++;
+                        int ni = static_cast<int>(i) + di;
+                        int nj = static_cast<int>(j) + dj;
+                        if (ni >= 0 && nj >= 0 && static_cast<arma::uword>(ni) < ZI.n_rows && static_cast<arma::uword>(nj) < ZI.n_cols && ZI(ni, nj) > 0)
+                        {
+                            valid_neighbors++;
+                        }
                     }
                 }
-                
-                if (valid_count < 2) continue;
-                double mean = sum / valid_count;
-                
-                // Calculate variance
-                double variance = 0.0;
-                for (int k = 0; k < layer_height && (i + k) < ZI.n_rows; ++k)
+                int window_size = (valid_neighbors < density_threshold * 9) ? max_window_size : min_window_size;
+                for (int di = -window_size; di <= window_size; ++di)
                 {
-                    if (ZI(i + k, j) > 0)
+                    for (int dj = -window_size; dj <= window_size; ++dj)
                     {
-                        variance += std::pow(ZI(i + k, j) - mean, 2.0);
+                        int ni = static_cast<int>(i) + di;
+                        int nj = static_cast<int>(j) + dj;
+                        if (ni >= 0 && nj >= 0 && static_cast<arma::uword>(ni) < ZI.n_rows && static_cast<arma::uword>(nj) < ZI.n_cols && ZI(ni, nj) > 0)
+                        {
+                            double distance = std::sqrt(di * di + dj * dj);
+                            double weight = 1.0 / (distance + 1e-6);
+                            weighted_sum += ZI(ni, nj) * weight;
+                            weight_total += weight;
+                        }
                     }
                 }
-                variance /= valid_count;
-                
-                // Filter high variance regions
-                if (variance > max_var)
+                if (weight_total > 0)
                 {
-                    for (int k = 0; k < layer_height && (i + k) < ZI.n_rows; ++k)
-                    {
-                        ZI(i + k, j) = 0;
-                    }
+                    ZI(i, j) = weighted_sum / weight_total;
                 }
             }
         }
     }
 
-    // Convert range image back to point cloud
+    // Compute gradients for edge detection
+    arma::mat Zenhanced = ZI;
+    arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
+    arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
+    arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
+
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
+    {
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
+        {
+            if (ZI(i, j) > 0)
+            {
+                grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
+                grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
+                grad_mag(i, j) = std::sqrt(grad_x(i, j) * grad_x(i, j) + grad_y(i, j) * grad_y(i, j));
+            }
+        }
+    }
+
+    double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
+    {
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
+        {
+            if (grad_mag(i, j) > edge_threshold)
+            {
+                double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
+                Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
+            }
+        }
+    }
+    ZI = Zenhanced;
+
+    // Calculate actual number of lines per layer based on interpolation
+    int actual_lines_per_layer = (ZI.n_rows > 0) ? std::max(1, static_cast<int>(ZI.n_rows) / num_layers) : max_lines;
+
+    if (f_pc)
+    {    
+        for (arma::uword i = 0; i < ((ZI.n_rows-1)/static_cast<arma::uword>(actual_lines_per_layer)); i += 1)       
+        {
+            for (arma::uword j = 0; j < ZI.n_cols-5 ; j += 1)
+            {
+                double promedio = 0;
+                double varianza = 0;
+                int valid_count = 0;
+                for (int k = 0; k < actual_lines_per_layer; k += 1)
+                {
+                    arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(k);
+                    if (row_idx < ZI.n_rows)
+                    {
+                        promedio += ZI(row_idx, j);
+                        valid_count++;
+                    }
+                }
+                if (valid_count > 0)
+                    promedio = promedio / valid_count;    
+                for (int l = 0; l < actual_lines_per_layer; l++) 
+                {
+                    arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(l);
+                    if (row_idx < ZI.n_rows)
+                    {
+                        varianza += pow((ZI(row_idx, j) - promedio), 2.0);  
+                    }
+                }
+                if (varianza > max_var)
+                {
+                    for (int m = 0; m < actual_lines_per_layer; m++) 
+                    {
+                        arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(m);
+                        if (row_idx < ZI.n_rows)
+                        {
+                            Zout(row_idx, j) = 0;                 
+                        }
+                    }
+                }   
+            }
+        }
+        ZI = Zout;
+    }
+
+    // imagen de rango a nube de puntos  
     int num_pc = 0; 
     PointCloud::Ptr point_cloud (new PointCloud);
     PointCloud::Ptr cloud (new PointCloud);
@@ -286,50 +437,41 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     point_cloud->is_dense = false;
     point_cloud->points.resize(point_cloud->width * point_cloud->height);
 
-    for (arma::uword i = 0; i < ZI.n_rows; i += 1)
+    for (arma::uword i = 0; i < ZI.n_rows - static_cast<arma::uword>(num_layers); i += 1)
     {       
         for (arma::uword j = 0; j < ZI.n_cols ; j += 1)
         {
-            if (ZI(i,j) <= 0) continue;
-            
             float ang = M_PI - ((2.0 * M_PI * static_cast<float>(j)) / (static_cast<float>(ZI.n_cols)));
             if (ang < min_FOV - M_PI/2.0 || ang > max_FOV - M_PI/2.0) 
                 continue;
 
-            float pc_modulo = ZI(i,j);
-            float z_val = (i < ZzI.n_rows && j < ZzI.n_cols) ? ZzI(i,j) : 0.0f;
-            
-            // Ensure we don't have invalid sqrt values
-            float xy_dist_sq = std::max(0.0f, pc_modulo*pc_modulo - z_val*z_val);
-            float xy_dist = std::sqrt(xy_dist_sq);
-            
-            float pc_x = xy_dist * cos(ang);
-            float pc_y = xy_dist * sin(ang);
+            if (!(Zout(i,j) == 0))
+            {  
+                float pc_modulo = Zout(i,j);
+                float pc_x = sqrt(pow(pc_modulo,2) - pow(ZzI(i,j),2)) * cos(ang);
+                float pc_y = sqrt(pow(pc_modulo,2) - pow(ZzI(i,j),2)) * sin(ang);
 
-            // Apply lidar rotation correction
-            float ang_x_lidar = 0.6 * M_PI / 180.0;  
-            Eigen::MatrixXf Lidar_matrix(3,3);
-            Eigen::MatrixXf result(3,1);
-            Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
-                            0, 1, 0,
-                            -sin(ang_x_lidar), 0, cos(ang_x_lidar);
-            result << pc_x, pc_y, z_val;
-            result = Lidar_matrix * result;
+                float ang_x_lidar = 0.6 * M_PI / 180.0;  
+                Eigen::MatrixXf Lidar_matrix(3,3);
+                Eigen::MatrixXf result(3,1);
+                Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
+                                0, 1, 0,
+                                -sin(ang_x_lidar), 0, cos(ang_x_lidar);
+                result << pc_x, pc_y, ZzI(i,j);
+                result = Lidar_matrix * result;
 
-            point_cloud->points[num_pc].x = result(0);
-            point_cloud->points[num_pc].y = result(1);
-            point_cloud->points[num_pc].z = result(2);
-            cloud->push_back(point_cloud->points[num_pc]); 
-            num_pc++;
+                point_cloud->points[num_pc].x = result(0);
+                point_cloud->points[num_pc].y = result(1);
+                point_cloud->points[num_pc].z = result(2);
+                cloud->push_back(point_cloud->points[num_pc]); 
+                num_pc++;
+            }
         }
     }  
-
-    ROS_INFO("Generated %d points from interpolated range image", num_pc);
 
     PointCloud::Ptr P_out (new PointCloud);
     P_out = cloud;
 
-    // Camera projection and visualization
     Eigen::MatrixXf RTlc(4,4);
     RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0),
             Rlc(1), Rlc(4), Rlc(7), Tlc(1),
@@ -337,8 +479,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
             0, 0, 0, 1;
 
     int size_inter_Lidar = (int) P_out->points.size();
+    Eigen::MatrixXf Lidar_camera(3, size_inter_Lidar);
     Eigen::MatrixXf Lidar_cam(3,1);
     Eigen::MatrixXf pc_matrix(4,1);
+    Eigen::MatrixXf pointCloud_matrix(4, size_inter_Lidar);
 
     unsigned int cols = in_image->width;
     unsigned int rows = in_image->height;
@@ -357,18 +501,16 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         pc_matrix(3,0) = 1.0;
 
         Lidar_cam = Mc * (RTlc * pc_matrix);
-        
-        // Check for valid depth
-        if (Lidar_cam(2,0) <= 0) continue;
-        
         px_data = (int)(Lidar_cam(0,0) / Lidar_cam(2,0));
         py_data = (int)(Lidar_cam(1,0) / Lidar_cam(2,0));
       
-        if (px_data < 0 || px_data >= cols || py_data < 0 || py_data >= rows)
+        if (px_data < 0.0 || px_data >= cols || py_data < 0.0 || py_data >= rows)
             continue;
 
-        int color_dis_x = (int)(255 * std::min(1.0f, (P_out->points[i].x) / maxlen));
-        int color_dis_z = (int)(255 * std::min(1.0f, (P_out->points[i].x) / 10.0f));
+        int color_dis_x = (int)(255 * ((P_out->points[i].x) / maxlen));
+        int color_dis_z = (int)(255 * ((P_out->points[i].x) / 10.0));
+        if (color_dis_z > 255)
+            color_dis_z = 255;
 
         cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
         point.x = P_out->points[i].x;
@@ -378,15 +520,12 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         point.g = (int)color[1]; 
         point.b = (int)color[0];
         pc_color->points.push_back(point);   
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, 
-                  CV_RGB(255-color_dis_x, color_dis_z, color_dis_x), cv::FILLED);
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255-color_dis_x, (int)(color_dis_z), color_dis_x), cv::FILLED);
     }
-    
     pc_color->is_dense = true;
     pc_color->width = (int) pc_color->points.size();
     pc_color->height = 1;
     pc_color->header.frame_id = "velodyne";
-    pcl_conversions::toPCL(in_pc2->header.stamp, pc_color->header.stamp);
 
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
     pc_pub.publish(pc_color);
