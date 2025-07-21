@@ -42,15 +42,15 @@ ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
 
 float maxlen = 100.0;       //maxima distancia del lidar
-float minlen = 0.01;     //minima distancia del lidar
-float max_FOV = 3.0;    // en radianes angulo maximo de vista de la camara
-float min_FOV = 0.4;    // en radianes angulo minimo de vista de la camara
+float minlen = 0.0;        //minima distancia del lidar (updated to match launch file)
+float max_FOV = 2.7;       // en radianes angulo maximo de vista de la camara (updated)
+float min_FOV = 0.5;       // en radianes angulo minimo de vista de la camara (updated)
 
 /// parametros para convertir nube de puntos en imagen
-float angular_resolution_x = 0.5f;
-float angular_resolution_y = 1.875f; // Adjusted to match VLP-16 layer spacing (30° / 16)
+float angular_resolution_x = 0.25f; // Updated to match launch file
+float angular_resolution_y = 0.5f;  // Finer resolution for more rows
 float max_angle_width = 360.0f;
-float max_angle_height = 30.0f; // Match VLP-16 vertical FOV (-15° to +15°)
+float max_angle_height = 30.0f;    // Match VLP-16 vertical FOV (-15° to +15°)
 float z_max = 100.0f;
 float z_min = 100.0f;
 
@@ -58,12 +58,12 @@ float max_depth = 100.0;
 float min_depth = 8.0;
 double max_var = 50.0; 
 
-float interpol_value = 20.0; // Base interpolation value, overridden for dynamic interpolation
+float interpol_value = 10.0; // Base interpolation value, overridden for dynamic interpolation
 
 bool f_pc = true; 
 
 // input topics 
-std::string imgTopic = "/camera/color/image_raw";
+std::string imgTopic = "/usb_cam/image_raw"; // Updated to match launch file
 std::string pcTopic = "/velodyne_points";
 
 //matrix calibration lidar and camera
@@ -105,6 +105,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
   
+    ROS_INFO("Point cloud size after NaN removal: %lu", cloud_in->points.size());
     for (int i = 0; i < (int) cloud_in->points.size(); i++)
     {
         double distance = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + cloud_in->points[i].y * cloud_in->points[i].y);     
@@ -112,6 +113,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
             continue;        
         cloud_out->push_back(cloud_in->points[i]);     
     }  
+    ROS_INFO("Point cloud size after distance filter: %lu", cloud_out->points.size());
 
     // point cloud to image 
     Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
@@ -163,36 +165,41 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); // Same horizontal resolution
 
     // Estimate maximum output rows
-    int max_output_rows = rows_img * max_lines;
-    arma::mat ZI(max_output_rows, cols_img); // Max size to accommodate finest interpolation
+    int max_output_rows = 0;
+    for (int layer = 0; layer < num_layers; ++layer)
+    {
+        max_output_rows += (base_lines + layer) * 2; // Conservative estimate
+    }
+    arma::mat ZI(max_output_rows, cols_img); // Max size
     arma::mat ZzI(max_output_rows, cols_img);
     ZI.zeros();
     ZzI.zeros();
 
     // Map angles to row indices
-    std::vector<int> row_indices(num_layers + 1); // Include top boundary
+    std::vector<int> row_indices(num_layers + 1);
     for (int i = 0; i < num_layers; ++i)
     {
         float angle_deg = vlp16_angles[i] * 180.0f / M_PI;
-        // Map angle to row: [vlp16_max_angle, vlp16_min_angle] -> [0, rows_img-1]
         float normalized = (vlp16_max_angle - angle_deg) / (vlp16_max_angle - vlp16_min_angle);
         row_indices[i] = std::round(normalized * (rows_img - 1));
     }
-    row_indices[num_layers] = rows_img; // Top boundary
+    row_indices[num_layers] = rows_img;
 
-    // Sort and ensure unique indices
+    // Ensure unique and sorted indices
     std::sort(row_indices.begin(), row_indices.end());
-    row_indices.erase(std::unique(row_indices.begin(), row_indices.end()), row_indices.end());
+    auto last = std::unique(row_indices.begin(), row_indices.end());
+    row_indices.erase(last, row_indices.end());
 
-    // Ensure at least num_layers boundaries
-    if (row_indices.size() < num_layers)
+    // Fallback to uniform division if insufficient indices
+    if (row_indices.size() <= num_layers)
     {
-        ROS_WARN("Insufficient unique row indices (%lu), expected %d. Adjusting...", row_indices.size(), num_layers);
+        ROS_WARN("Insufficient unique row indices (%lu), expected %d. Using uniform division.", row_indices.size(), num_layers + 1);
         row_indices.resize(num_layers + 1);
-        int rows_per_layer = rows_img / num_layers;
+        int rows_per_layer = std::max(2, rows_img / num_layers); // Ensure at least 2 rows
         for (int i = 0; i <= num_layers; ++i)
         {
             row_indices[i] = i * rows_per_layer;
+            if (row_indices[i] >= rows_img) row_indices[i] = rows_img - 1;
         }
         row_indices[num_layers] = rows_img;
     }
@@ -204,12 +211,11 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         int num_lines = base_lines + layer; // 6, 7, ..., 21
         float interpol_step = 1.0f / num_lines;
 
-        // Define row range for this layer
         int row_start = row_indices[layer];
         int row_end = row_indices[layer + 1];
         if (row_end <= row_start + 1)
         {
-            row_end = row_start + 2; // Ensure at least 2 rows
+            row_end = row_start + 2;
             if (row_end > rows_img) row_end = rows_img;
         }
 
@@ -223,6 +229,12 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         }
 
         arma::vec YI_layer = arma::regspace(Y_layer.min(), interpol_step, Y_layer.max());
+        int expected_rows = std::ceil((row_end - row_start) * num_lines);
+        if (YI_layer.n_elem > expected_rows)
+        {
+            YI_layer = YI_layer.subvec(0, expected_rows - 1);
+        }
+
         ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%lu, YI_layer.size=%lu",
                  layer, row_start, row_end - 1, num_lines, Y_layer.n_elem, YI_layer.n_elem);
 
@@ -241,7 +253,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         // Copy to output matrices
         for (uint i = 0; i < ZI_layer.n_rows && current_row_output + i < max_output_rows; ++i)
         {
-            for (uint j = 0; j < ZI_layer.n_cols; ++j)
+            for (uint j = 0; j < ZI_layer.n_cols && j < cols_img; ++j)
             {
                 ZI(current_row_output + i, j) = ZI_layer(i, j);
                 ZzI(current_row_output + i, j) = ZzI_layer(i, j);
@@ -377,28 +389,31 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
             {
                 double promedio = 0;
                 double varianza = 0;
-                for (uint k = 0; k < num_layers ; k += 1)
+                int valid_count = 0;
+                for (uint k = 0; k < num_lines; k += 1)
                 {
-                    if ((i * num_layers) + k < ZI.n_rows)
+                    if ((i * num_lines) + k < ZI.n_rows)
                     {
-                        promedio += ZI((i * num_layers) + k, j);
+                        promedio += ZI((i * num_lines) + k, j);
+                        valid_count++;
                     }
                 }
-                promedio = promedio / num_layers;    
-                for (uint l = 0; l < num_layers; l++) 
+                if (valid_count > 0)
+                    promedio = promedio / valid_count;    
+                for (uint l = 0; l < num_lines; l++) 
                 {
-                    if ((i * num_layers) + l < ZI.n_rows)
+                    if ((i * num_lines) + l < ZI.n_rows)
                     {
-                        varianza += pow((ZI((i * num_layers) + l, j) - promedio), 2.0);  
+                        varianza += pow((ZI((i * num_lines) + l, j) - promedio), 2.0);  
                     }
                 }
                 if (varianza > max_var)
                 {
-                    for (uint m = 0; m < num_layers; m++) 
+                    for (uint m = 0; m < num_lines; m++) 
                     {
-                        if ((i * num_layers) + m < ZI.n_rows)
+                        if ((i * num_lines) + m < ZI.n_rows)
                         {
-                            Zout((i * num_layers) + m, j) = 0;                 
+                            Zout((i * num_lines) + m, j) = 0;                 
                         }
                     }
                 }   
