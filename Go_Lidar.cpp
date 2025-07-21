@@ -105,7 +105,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
   
-    ROS_INFO("Point cloud size after NaN removal: %lu", cloud_in->points.size());
+    ROS_INFO("Point cloud size after NaN removal: %zu", cloud_in->points.size());
     for (int i = 0; i < (int) cloud_in->points.size(); i++)
     {
         double distance = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + cloud_in->points[i].y * cloud_in->points[i].y);     
@@ -113,7 +113,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
             continue;        
         cloud_out->push_back(cloud_in->points[i]);     
     }  
-    ROS_INFO("Point cloud size after distance filter: %lu", cloud_out->points.size());
+    ROS_INFO("Point cloud size after distance filter: %zu", cloud_out->points.size());
 
     // point cloud to image 
     Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
@@ -191,9 +191,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     row_indices.erase(last, row_indices.end());
 
     // Fallback to uniform division if insufficient indices
-    if (row_indices.size() <= num_layers)
+    if (row_indices.size() <= static_cast<size_t>(num_layers))
     {
-        ROS_WARN("Insufficient unique row indices (%lu), expected %d. Using uniform division.", row_indices.size(), num_layers + 1);
+        ROS_WARN("Insufficient unique row indices (%zu), expected %d. Using uniform division.", row_indices.size(), num_layers + 1);
         row_indices.resize(num_layers + 1);
         int rows_per_layer = std::max(2, rows_img / num_layers); // Ensure at least 2 rows
         for (int i = 0; i <= num_layers; ++i)
@@ -230,13 +230,13 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
         arma::vec YI_layer = arma::regspace(Y_layer.min(), interpol_step, Y_layer.max());
         int expected_rows = std::ceil((row_end - row_start) * num_lines);
-        if (YI_layer.n_elem > expected_rows)
+        if (YI_layer.n_elem > static_cast<arma::uword>(expected_rows))
         {
             YI_layer = YI_layer.subvec(0, expected_rows - 1);
         }
 
-        ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%lu, YI_layer.size=%lu",
-                 layer, row_start, row_end - 1, num_lines, Y_layer.n_elem, YI_layer.n_elem);
+        ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%zu, YI_layer.size=%zu",
+                 layer, row_start, row_end - 1, num_lines, static_cast<size_t>(Y_layer.n_elem), static_cast<size_t>(YI_layer.n_elem));
 
         arma::mat ZI_layer, ZzI_layer;
         try
@@ -251,9 +251,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         }
 
         // Copy to output matrices
-        for (uint i = 0; i < ZI_layer.n_rows && current_row_output + i < max_output_rows; ++i)
+        for (arma::uword i = 0; i < ZI_layer.n_rows && current_row_output + static_cast<int>(i) < max_output_rows; ++i)
         {
-            for (uint j = 0; j < ZI_layer.n_cols && j < cols_img; ++j)
+            for (arma::uword j = 0; j < ZI_layer.n_cols && static_cast<int>(j) < cols_img; ++j)
             {
                 ZI(current_row_output + i, j) = ZI_layer(i, j);
                 ZzI(current_row_output + i, j) = ZzI_layer(i, j);
@@ -269,24 +269,24 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     }
     ZI = ZI.rows(0, current_row_output - 1);
     ZzI = ZzI.rows(0, current_row_output - 1);
-    ROS_INFO("Interpolated output: ZI.rows=%lu, ZI.cols=%lu", ZI.n_rows, ZI.n_cols);
+    ROS_INFO("Interpolated output: ZI.rows=%zu, ZI.cols=%zu", static_cast<size_t>(ZI.n_rows), static_cast<size_t>(ZI.n_cols));
 
     // Handle zeros in interpolation
     arma::mat Zout = ZI;
-    for (uint i = 0; i < ZI.n_rows; i++)
+    for (arma::uword i = 0; i < ZI.n_rows; i++)
     {
-        for (uint j = 0; j < ZI.n_cols; j++)
+        for (arma::uword j = 0; j < ZI.n_cols; j++)
         {
             if (ZI(i, j) == 0)
             {
-                if (i + num_layers < ZI.n_rows)
+                if (i + static_cast<arma::uword>(num_layers) < ZI.n_rows)
                 {
                     for (int k = 1; k <= num_layers; k++)
                     {
                         Zout(i + k, j) = 0;
                     }
                 }
-                if (i > num_layers)
+                if (i > static_cast<arma::uword>(num_layers))
                 {
                     for (int k = 1; k <= num_layers; k++)
                     {
@@ -303,9 +303,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     int max_window_size = 9;
     int min_window_size = 3;
 
-    for (uint i = 1; i < ZI.n_rows - 1; ++i)
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
     {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j)
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
         {
             if (ZI(i, j) == 0)
             {
@@ -316,9 +316,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
                 {
                     for (int dj = -1; dj <= 1; ++dj)
                     {
-                        int ni = i + di;
-                        int nj = j + dj;
-                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0)
+                        int ni = static_cast<int>(i) + di;
+                        int nj = static_cast<int>(j) + dj;
+                        if (ni >= 0 && nj >= 0 && static_cast<arma::uword>(ni) < ZI.n_rows && static_cast<arma::uword>(nj) < ZI.n_cols && ZI(ni, nj) > 0)
                         {
                             valid_neighbors++;
                         }
@@ -329,9 +329,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
                 {
                     for (int dj = -window_size; dj <= window_size; ++dj)
                     {
-                        int ni = i + di;
-                        int nj = j + dj;
-                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0)
+                        int ni = static_cast<int>(i) + di;
+                        int nj = static_cast<int>(j) + dj;
+                        if (ni >= 0 && nj >= 0 && static_cast<arma::uword>(ni) < ZI.n_rows && static_cast<arma::uword>(nj) < ZI.n_cols && ZI(ni, nj) > 0)
                         {
                             double distance = std::sqrt(di * di + dj * dj);
                             double weight = 1.0 / (distance + 1e-6);
@@ -354,9 +354,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
 
-    for (uint i = 1; i < ZI.n_rows - 1; ++i)
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
     {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j)
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
         {
             if (ZI(i, j) > 0)
             {
@@ -368,9 +368,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     }
 
     double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
-    for (uint i = 1; i < ZI.n_rows - 1; ++i)
+    for (arma::uword i = 1; i < ZI.n_rows - 1; ++i)
     {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j)
+        for (arma::uword j = 1; j < ZI.n_cols - 1; ++j)
         {
             if (grad_mag(i, j) > edge_threshold)
             {
@@ -381,39 +381,45 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     }
     ZI = Zenhanced;
 
+    // Calculate actual number of lines per layer based on interpolation
+    int actual_lines_per_layer = (ZI.n_rows > 0) ? std::max(1, static_cast<int>(ZI.n_rows) / num_layers) : max_lines;
+
     if (f_pc)
     {    
-        for (uint i = 0; i < ((ZI.n_rows-1)/num_layers); i += 1)       
+        for (arma::uword i = 0; i < ((ZI.n_rows-1)/static_cast<arma::uword>(actual_lines_per_layer)); i += 1)       
         {
-            for (uint j = 0; j < ZI.n_cols-5 ; j += 1)
+            for (arma::uword j = 0; j < ZI.n_cols-5 ; j += 1)
             {
                 double promedio = 0;
                 double varianza = 0;
                 int valid_count = 0;
-                for (uint k = 0; k < num_lines; k += 1)
+                for (int k = 0; k < actual_lines_per_layer; k += 1)
                 {
-                    if ((i * num_lines) + k < ZI.n_rows)
+                    arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(k);
+                    if (row_idx < ZI.n_rows)
                     {
-                        promedio += ZI((i * num_lines) + k, j);
+                        promedio += ZI(row_idx, j);
                         valid_count++;
                     }
                 }
                 if (valid_count > 0)
                     promedio = promedio / valid_count;    
-                for (uint l = 0; l < num_lines; l++) 
+                for (int l = 0; l < actual_lines_per_layer; l++) 
                 {
-                    if ((i * num_lines) + l < ZI.n_rows)
+                    arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(l);
+                    if (row_idx < ZI.n_rows)
                     {
-                        varianza += pow((ZI((i * num_lines) + l, j) - promedio), 2.0);  
+                        varianza += pow((ZI(row_idx, j) - promedio), 2.0);  
                     }
                 }
                 if (varianza > max_var)
                 {
-                    for (uint m = 0; m < num_lines; m++) 
+                    for (int m = 0; m < actual_lines_per_layer; m++) 
                     {
-                        if ((i * num_lines) + m < ZI.n_rows)
+                        arma::uword row_idx = (i * static_cast<arma::uword>(actual_lines_per_layer)) + static_cast<arma::uword>(m);
+                        if (row_idx < ZI.n_rows)
                         {
-                            Zout((i * num_lines) + m, j) = 0;                 
+                            Zout(row_idx, j) = 0;                 
                         }
                     }
                 }   
@@ -431,11 +437,11 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     point_cloud->is_dense = false;
     point_cloud->points.resize(point_cloud->width * point_cloud->height);
 
-    for (uint i = 0; i < ZI.n_rows - num_layers; i += 1)
+    for (arma::uword i = 0; i < ZI.n_rows - static_cast<arma::uword>(num_layers); i += 1)
     {       
-        for (uint j = 0; j < ZI.n_cols ; j += 1)
+        for (arma::uword j = 0; j < ZI.n_cols ; j += 1)
         {
-            float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
+            float ang = M_PI - ((2.0 * M_PI * static_cast<float>(j)) / (static_cast<float>(ZI.n_cols)));
             if (ang < min_FOV - M_PI/2.0 || ang > max_FOV - M_PI/2.0) 
                 continue;
 
@@ -554,7 +560,7 @@ int main(int argc, char** argv)
     Mc << (double)param[0], (double)param[1], (double)param[2], (double)param[3],
           (double)param[4], (double)param[5], (double)param[6], (double)param[7],
           (double)param[8], (double)param[9], (double)param[10], (double)param[11];
-
+    
     message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic , 1);
     message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);
     typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
