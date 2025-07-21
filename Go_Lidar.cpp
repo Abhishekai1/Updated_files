@@ -48,9 +48,9 @@ float min_FOV = 0.4;    // en radianes angulo minimo de vista de la camara
 
 /// parametros para convertir nube de puntos en imagen
 float angular_resolution_x = 0.5f;
-float angular_resolution_y = 2.1f;
+float angular_resolution_y = 1.875f; // Adjusted to match VLP-16 layer spacing (30° / 16)
 float max_angle_width = 360.0f;
-float max_angle_height = 180.0f;
+float max_angle_height = 30.0f; // Match VLP-16 vertical FOV (-15° to +15°)
 float z_max = 100.0f;
 float z_min = 100.0f;
 
@@ -121,6 +121,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
 
     int cols_img = rangeImage->width;
     int rows_img = rangeImage->height;
+    ROS_INFO("Range image created: width=%d, height=%d", cols_img, rows_img);
 
     arma::mat Z;  // interpolation de la imagen
     arma::mat Zz; // interpolation de las alturas de la imagen
@@ -147,74 +148,84 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     ////////////////////////////////////////////// dynamic interpolation
     // VLP-16 has 16 layers, vertical FOV from -15 to +15 degrees (30 degrees total)
     const int num_layers = 16;
-    const float vlp16_fov = 30.0f; // degrees, -15 to +15
-    const float deg_per_layer = vlp16_fov / num_layers; // 1.875 degrees per layer
-    const int base_lines = 6; // Starting number of interpolated lines for first layer
-    const int max_lines = 21; // Maximum number of interpolated lines for last layer
     const float vlp16_min_angle = -15.0f; // Minimum vertical angle in degrees
     const float vlp16_max_angle = 15.0f;  // Maximum vertical angle in degrees
+    const int base_lines = 6; // Starting number of interpolated lines for first layer
+    const int max_lines = 21; // Maximum number of interpolated lines for last layer
+
+    // VLP-16 vertical angles from log (in radians)
+    std::vector<float> vlp16_angles = {
+        -0.261799, -0.226893, -0.191986, -0.157080, -0.122173, -0.087266, -0.052360, -0.017453,
+        0.017453, 0.052360, 0.087266, 0.122173, 0.157080, 0.191986, 0.226893, 0.261799
+    };
 
     arma::vec X = arma::regspace(1, cols_img);  // X = horizontal spacing
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); // Same horizontal resolution
 
-    // Initialize output interpolated matrices
-    arma::mat ZI(rows_img * max_lines, cols_img); // Max size to accommodate finest interpolation
-    arma::mat ZzI(rows_img * max_lines, cols_img);
+    // Estimate maximum output rows
+    int max_output_rows = rows_img * max_lines;
+    arma::mat ZI(max_output_rows, cols_img); // Max size to accommodate finest interpolation
+    arma::mat ZzI(max_output_rows, cols_img);
     ZI.zeros();
     ZzI.zeros();
 
-    // Map VLP-16 angles to rows
-    std::vector<float> vlp16_angles = {
-        -0.261799, -0.226893, -0.191986, -0.157080, -0.122173, -0.087266, -0.052360, -0.017453,
-        0.017453, 0.052360, 0.087266, 0.122173, 0.157080, 0.191986, 0.226893, 0.261799
-    }; // Radians, from log output
-
-    // Convert angles to row indices
-    std::vector<int> row_indices(num_layers);
+    // Map angles to row indices
+    std::vector<int> row_indices(num_layers + 1); // Include top boundary
     for (int i = 0; i < num_layers; ++i)
     {
-        // Map angle to row index: rangeImage maps [0, rows_img-1] to [max_angle_height/2, -max_angle_height/2]
-        float angle_deg = vlp16_angles[i] * 180.0f / M_PI; // Convert to degrees
-        // Normalize angle to [0, 1] within the range image's vertical FOV
+        float angle_deg = vlp16_angles[i] * 180.0f / M_PI;
+        // Map angle to row: [vlp16_max_angle, vlp16_min_angle] -> [0, rows_img-1]
         float normalized = (vlp16_max_angle - angle_deg) / (vlp16_max_angle - vlp16_min_angle);
         row_indices[i] = std::round(normalized * (rows_img - 1));
     }
+    row_indices[num_layers] = rows_img; // Top boundary
 
-    // Ensure row indices are sorted and unique
+    // Sort and ensure unique indices
     std::sort(row_indices.begin(), row_indices.end());
     row_indices.erase(std::unique(row_indices.begin(), row_indices.end()), row_indices.end());
+
+    // Ensure at least num_layers boundaries
+    if (row_indices.size() < num_layers)
+    {
+        ROS_WARN("Insufficient unique row indices (%lu), expected %d. Adjusting...", row_indices.size(), num_layers);
+        row_indices.resize(num_layers + 1);
+        int rows_per_layer = rows_img / num_layers;
+        for (int i = 0; i <= num_layers; ++i)
+        {
+            row_indices[i] = i * rows_per_layer;
+        }
+        row_indices[num_layers] = rows_img;
+    }
 
     // Interpolate each layer with increasing density
     int current_row_output = 0;
     for (int layer = 0; layer < num_layers; ++layer)
     {
-        // Calculate number of interpolated lines for this layer
-        int num_lines = base_lines + layer; // 6, 7, 8, ..., up to 21 for layer 15
+        int num_lines = base_lines + layer; // 6, 7, ..., 21
         float interpol_step = 1.0f / num_lines;
 
         // Define row range for this layer
-        int row_start = (layer == 0) ? 0 : row_indices[layer - 1];
-        int row_end = (layer == num_layers - 1) ? rows_img : row_indices[layer];
-        if (row_end <= row_start + 1) // Ensure at least 2 rows for interpolation
+        int row_start = row_indices[layer];
+        int row_end = row_indices[layer + 1];
+        if (row_end <= row_start + 1)
         {
-            row_end = row_start + 2; // Minimum size to avoid interp2 error
+            row_end = row_start + 2; // Ensure at least 2 rows
             if (row_end > rows_img) row_end = rows_img;
         }
 
-        // Extract submatrix for this layer
         arma::mat Z_layer = Z.rows(row_start, row_end - 1);
         arma::mat Zz_layer = Zz.rows(row_start, row_end - 1);
         arma::vec Y_layer = arma::regspace(row_start + 1, row_end);
 
-        // Ensure Y_layer has at least two unique elements
         if (Y_layer.n_elem < 2)
         {
             Y_layer = arma::vec({static_cast<double>(row_start + 1), static_cast<double>(row_end)});
         }
 
         arma::vec YI_layer = arma::regspace(Y_layer.min(), interpol_step, Y_layer.max());
+        ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%lu, YI_layer.size=%lu",
+                 layer, row_start, row_end - 1, num_lines, Y_layer.n_elem, YI_layer.n_elem);
 
-        // Interpolate this layer
         arma::mat ZI_layer, ZzI_layer;
         try
         {
@@ -224,25 +235,21 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         catch (const std::exception& e)
         {
             ROS_ERROR("Interpolation error in layer %d: %s", layer, e.what());
-            continue; // Skip this layer to prevent crash
+            continue;
         }
 
-        // Copy interpolated data to output matrices
-        for (uint i = 0; i < ZI_layer.n_rows; ++i)
+        // Copy to output matrices
+        for (uint i = 0; i < ZI_layer.n_rows && current_row_output + i < max_output_rows; ++i)
         {
             for (uint j = 0; j < ZI_layer.n_cols; ++j)
             {
-                if (current_row_output + i < ZI.n_rows)
-                {
-                    ZI(current_row_output + i, j) = ZI_layer(i, j);
-                    ZzI(current_row_output + i, j) = ZzI_layer(i, j);
-                }
+                ZI(current_row_output + i, j) = ZI_layer(i, j);
+                ZzI(current_row_output + i, j) = ZzI_layer(i, j);
             }
         }
         current_row_output += ZI_layer.n_rows;
     }
 
-    // Resize ZI and ZzI to actual output size
     if (current_row_output == 0)
     {
         ROS_ERROR("No valid interpolated rows produced. Check range image configuration.");
@@ -250,6 +257,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     }
     ZI = ZI.rows(0, current_row_output - 1);
     ZzI = ZzI.rows(0, current_row_output - 1);
+    ROS_INFO("Interpolated output: ZI.rows=%lu, ZI.cols=%lu", ZI.n_rows, ZI.n_cols);
 
     // Handle zeros in interpolation
     arma::mat Zout = ZI;
