@@ -48,7 +48,7 @@ float min_FOV = 0.4;        //en radianes angulo minimo de vista de la camara
 
 ///parametros para convertir nube de puntos en imagen
 float angular_resolution_x = 0.25f; //from launch file
-float angular_resolution_y = 0.46875f; //30° / 64 rows for better layer distribution
+float angular_resolution_y = 0.46875f; //30° / 64 rows
 float max_angle_width = 360.0f;
 float max_angle_height = 30.0f;    //match VLP-16 vertical FOV (-15° to +15°)
 float z_max = 100.0f;
@@ -121,8 +121,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
                                         pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height),
                                         sensorPose, coordinate_frame, 0.0f, 0.0f, 0);
 
-    int(cols_img) = rangeImage->width;
-    int(rows_img) = rangeImage->height;
+    int cols_img = rangeImage->width;
+    int rows_img = rangeImage->height;
     ROS_INFO("Range image created: width=%d, height=%d, points=%lu", cols_img, rows_img, cloud_out->points.size());
 
     arma::mat Z;  //interpolation de la imagen
@@ -163,23 +163,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     arma::vec X = arma::regspace(1, cols_img);  //X = horizontal spacing
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); //Same horizontal resolution
 
-    //Estimate total output rows
-    int total_output_rows = 0;
-    std::vector<int> rows_per_layer(num_layers);
-    for (int layer = 0; layer < num_layers; ++layer)
-    {
-        int num_lines = base_lines + layer;
-        rows_per_layer[layer] = num_lines;
-        total_output_rows += num_lines;
-    }
-    total_output_rows = std::min(total_output_rows, rows_img * max_lines);
-
-    arma::mat ZI(total_output_rows, cols_img); //Size based on total interpolated rows
-    arma::mat ZzI(total_output_rows, cols_img);
-    ZI.zeros();
-    ZzI.zeros();
-
-    //Map angles to row indices
+    //Pre-calculate total output rows based on actual interpolation
     std::vector<int> row_indices(num_layers + 1);
     for (int i = 0; i < num_layers; ++i)
     {
@@ -212,6 +196,35 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         ROS_INFO("  [%lu] = %d", i, row_indices[i]);
     }
 
+    //Calculate total output rows dynamically
+    int total_output_rows = 0;
+    std::vector<int> rows_per_layer(num_layers);
+    for (int layer = 0; layer < num_layers; ++layer)
+    {
+        int row_start = row_indices[layer];
+        int row_end = row_indices[layer + 1];
+        if (row_end <= row_start + 1)
+        {
+            row_end = row_start + 2;
+            if (row_end > rows_img) row_end = rows_img;
+        }
+        int num_input_rows = row_end - row_start;
+        if (num_input_rows < 2) continue; //Skip layers with insufficient rows
+        int num_lines = base_lines + layer;
+        int output_rows = num_input_rows * num_lines; //Estimate output rows
+        rows_per_layer[layer] = output_rows;
+        total_output_rows += output_rows;
+    }
+
+    //Cap total_output_rows to prevent excessive allocation
+    total_output_rows = std::min(total_output_rows, rows_img * max_lines * 2);
+    ROS_INFO("Estimated total output rows: %d", total_output_rows);
+
+    arma::mat ZI(total_output_rows, cols_img); //Size based on actual output rows
+    arma::mat ZzI(total_output_rows, cols_img);
+    ZI.zeros();
+    ZzI.zeros();
+
     //Interpolate each layer
     int current_row_output = 0;
     for (int layer = 0; layer < num_layers; ++layer)
@@ -223,7 +236,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         int row_end = row_indices[layer + 1];
         if (row_end <= row_start + 1)
         {
-            row_end = row_start + 2; //Ensure at least 2 rows
+            row_end = row_start + 2;
             if (row_end > rows_img) row_end = rows_img;
         }
 
