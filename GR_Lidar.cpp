@@ -163,23 +163,6 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
     arma::vec X = arma::regspace(1, cols_img);  //X = horizontal spacing
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max()); //Same horizontal resolution
 
-    //Pre-calculate total output rows
-    int total_output_rows = 0;
-    std::vector<int> rows_per_layer(num_layers);
-    for (int layer = 0; layer < num_layers; ++layer)
-    {
-        int num_lines = base_lines + layer; //4 to 19
-        rows_per_layer[layer] = num_lines;
-        total_output_rows += num_lines; //Sum of 4 + 5 + ... + 19 = 176
-    }
-
-    ROS_INFO("Estimated total output rows: %d", total_output_rows);
-
-    arma::mat ZI(total_output_rows, cols_img); //Size based on exact output rows
-    arma::mat ZzI(total_output_rows, cols_img);
-    ZI.zeros();
-    ZzI.zeros();
-
     //Map angles to row indices
     std::vector<int> row_indices(num_layers + 1);
     for (int i = 0; i < num_layers; ++i)
@@ -213,6 +196,23 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         ROS_INFO("  [%lu] = %d", i, row_indices[i]);
     }
 
+    //Pre-calculate total output rows
+    int total_output_rows = 0;
+    std::vector<int> rows_per_layer(num_layers);
+    for (int layer = 0; layer < num_layers; ++layer)
+    {
+        int num_lines = base_lines + layer; //4 to 19
+        rows_per_layer[layer] = num_lines;
+        total_output_rows += num_lines; //Sum of 4 + 5 + ... + 19 = 176
+    }
+
+    ROS_INFO("Estimated total output rows: %d", total_output_rows);
+
+    arma::mat ZI(total_output_rows, cols_img); //Size based on exact output rows
+    arma::mat ZzI(total_output_rows, cols_img);
+    ZI.zeros();
+    ZzI.zeros();
+
     //Interpolate each layer
     int current_row_output = 0;
     for (int layer = 0; layer < num_layers; ++layer)
@@ -220,11 +220,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
         int num_lines = base_lines + layer; //4 to 19
         int row_start = row_indices[layer];
         int row_end = row_indices[layer + 1];
-        if (row_end <= row_start + 1)
-        {
-            row_end = row_start + 2;
-            if (row_end > rows_img) row_end = rows_img;
-        }
+        if (row_end <= row_start) row_end = row_start + 1; //Ensure at least one row
 
         arma::mat Z_layer = Z.rows(row_start, row_end - 1);
         arma::mat Zz_layer = Zz.rows(row_start, row_end - 1);
@@ -237,7 +233,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2 , 
             continue;
         }
 
-        arma::vec YI_layer = arma::regspace(row_start + 1, 1.0, row_start + num_lines); //Exactly num_lines rows
+        //Ensure YI_layer has exactly num_lines rows
+        arma::vec YI_layer = arma::regspace(1, 1.0, num_lines);
         ROS_INFO("Layer %d: rows %d to %d, num_lines=%d, Y_layer.size=%lu, YI_layer.size=%lu",
                  layer, row_start, row_end - 1, num_lines, Y_layer.n_elem, YI_layer.n_elem);
 
