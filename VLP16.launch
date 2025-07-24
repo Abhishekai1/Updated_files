@@ -9,7 +9,7 @@
     
     <param name="x_resolution"    type="double" value="0.25" />
     <param name="y_interpolation" type="double" value="10.0" />
-    <param name="ang_Y_resolution" type="double" value="0.5" />
+    <param name="ang_Y_resolution" type="double" value="0.46875" />
     <param name="max_var"         type="double" value="50.0" />
     <param name="filter_output_pc" type="bool"   value="true" />
 
@@ -23,6 +23,6 @@
     <include file="$(find velodyne_pointcloud)/launch/VLP16_points.launch" />
 
     <!-- camera -->
-    <!-- rviz
-    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find lidar_camera_fusion)/rviz/lidar_camera.rviz" />-->
+    <!-- rviz -->
+    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find lidar_camera_fusion)/rviz/lidar_camera.rviz" />
 </launch>
