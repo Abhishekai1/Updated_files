@@ -51,8 +51,8 @@ float min_depth = 8.0;
 double max_var = 50.0;
 float interpol_value = 20.0;
 float far_depth_threshold = 50.0f;
-float far_interpol_scale = 0.05f; // 20x denser for far regions
-float interpol_steepness = 0.3f;  // Sharper transition
+float far_interpol_scale = 0.03f; // 33x denser for far regions
+float interpol_steepness = 0.4f;  // Sharper transition
 bool f_pc = true;
 std::string imgTopic = "/camera/color/image_raw";
 std::string pcTopic = "/velodyne_points";
@@ -111,8 +111,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         for (int j = 0; j < rows_img; ++j) {
             float r = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).range;
             float zz = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).z;
-            if (std::isinf(r) || r < minlen || r > maxlen || std::isnan(zz)) {
-                continue;
+            float ang = M_PI - (2.0 * M_PI * i) / cols_img; // Approximate angular position
+            if (std::isinf(r) || std::isnan(zz) || r < minlen * 1.1 || r > maxlen || ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) {
+                continue; // Stricter noise filtering
             }
             Z.at(j, i) = r;
             Zz.at(j, i) = zz;
@@ -145,11 +146,11 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
     arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
 
-    // Gaussian interpolation for far regions
-    double density_threshold = 0.05;
-    int max_window_size = 9;
+    // Gaussian interpolation for far regions with noise control
+    double density_threshold = 0.1; // Slightly higher to reduce noise amplification
+    int max_window_size = 11;       // Larger window for better far-range filling
     int min_window_size = 3;
-    arma::mat Zout = ZI; // Use existing Zout
+    arma::mat Zout = ZI;
 
     for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
         for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
@@ -159,7 +160,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                     for (int dj = -1; dj <= 1; ++dj) {
                         unsigned int ni = i + di;
                         unsigned int nj = j + dj;
-                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0 && ZI(ni, nj) < maxlen * 1.1) {
                             valid_neighbors++;
                         }
                     }
@@ -174,16 +175,16 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                     for (int dj = -window_size; dj <= window_size; ++dj) {
                         unsigned int ni = i + di;
                         unsigned int nj = j + dj;
-                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0 && ZI(ni, nj) < maxlen * 1.1) {
                             double distance = std::sqrt(di * di + dj * dj);
-                            double weight = ZI(ni, nj) > far_depth_threshold ? 1.5 / (distance + 1e-6) : 1.0 / (distance + 1e-6);
+                            double weight = ZI(ni, nj) > far_depth_threshold ? 2.0 / (distance + 1e-6) : 1.0 / (distance + 1e-6);
                             weighted_sum += ZI(ni, nj) * weight;
                             weight_total += weight;
                         }
                     }
                 }
 
-                if (weight_total > 0) {
+                if (weight_total > 0 && valid_neighbors > 1) { // Require at least 2 valid neighbors to reduce noise
                     Zout(i, j) = weighted_sum / weight_total;
                 }
             }
