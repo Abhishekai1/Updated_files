@@ -147,8 +147,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
 
     // Gaussian interpolation for far regions with noise control
-    double density_threshold = 0.1; // Slightly higher to reduce noise amplification
-    int max_window_size = 11;       // Larger window for better far-range filling
+    double density_threshold = 0.1;
+    int max_window_size = 11;
     int min_window_size = 3;
     arma::mat Zout = ZI;
 
@@ -184,7 +184,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                     }
                 }
 
-                if (weight_total > 0 && valid_neighbors > 1) { // Require at least 2 valid neighbors to reduce noise
+                if (weight_total > 0 && valid_neighbors > 1) {
                     Zout(i, j) = weighted_sum / weight_total;
                 }
             }
@@ -244,17 +244,24 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         ZI = Zout;
     }
 
-    // Debug visualization for far-range points
-    cv::Mat range_img(ZI.n_rows, ZI.n_cols, CV_32F, ZI.memptr());
-    cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
-    cv::Mat far_mask(ZI.n_rows, ZI.n_cols, CV_8U, cv::Scalar(0));
+    // Debug visualization for far-range points with fixed bounds
+    cv::Mat range_img = cv::Mat(ZI.n_rows, ZI.n_cols, CV_32F);
     for (unsigned int i = 0; i < ZI.n_rows; ++i) {
         for (unsigned int j = 0; j < ZI.n_cols; ++j) {
+            range_img.at<float>(i, j) = ZI(i, j);
+        }
+    }
+    cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+    cv::Mat far_mask = cv::Mat(ZI.n_rows, ZI.n_cols, CV_8U, cv::Scalar(0));
+    for (unsigned int i = 0; i < ZI.n_rows && i < far_mask.rows; ++i) {
+        for (unsigned int j = 0; j < ZI.n_cols && j < far_mask.cols; ++j) {
             if (ZI(i, j) > far_depth_threshold) {
                 far_mask.at<uint8_t>(i, j) = 255;
             }
         }
     }
+
     sensor_msgs::ImagePtr range_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", range_img).toImageMsg();
     sensor_msgs::ImagePtr far_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", far_mask).toImageMsg();
     range_msg->header.frame_id = "camera";
