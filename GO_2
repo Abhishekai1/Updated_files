@@ -18,6 +18,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/sync_policies/exact_time.h>
 #include <Eigen/Dense>
+#include <sstream>
 #include <chrono>
 #include <thread>
 #include <stdexcept>
@@ -49,8 +50,10 @@ struct Config {
     float min_depth = 8.0f;
     double max_var = 50.0;
     float interpol_value = 20.0f;
-    float far_depth_threshold = 50.0f; // Depth above which to increase interpolation density
-    float far_interpol_scale = 0.5f;   // Scale factor for interpolation step in far regions
+    float far_depth_threshold = 50.0f;
+    float far_interpol_scale = 0.5f;
+    float max_interpol_scale = 0.2f; // Maximum step size reduction
+    float interpol_steepness = 0.1f; // Steepness of logistic function
     bool filter_pc = true;
     float voxel_leaf_size = 0.1f;
     int sor_mean_k = 50;
@@ -72,6 +75,14 @@ Eigen::MatrixXf Dc(1, 5);
 // Range Image
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
+
+// Function to convert Eigen matrix to string
+template<typename Derived>
+std::string eigenToString(const Eigen::MatrixBase<Derived>& mat) {
+    std::stringstream ss;
+    ss << mat.format(IOFormat(4, 0, ", ", "\n", "[", "]"));
+    return ss.str();
+}
 
 // Function to validate rotation matrix
 bool isValidRotationMatrix(const Eigen::Matrix3f& R) {
@@ -102,11 +113,13 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
     nh.param("/use_intensity_color", cfg.use_intensity_color, cfg.use_intensity_color);
     nh.param("/far_depth_threshold", cfg.far_depth_threshold, cfg.far_depth_threshold);
     nh.param("/far_interpol_scale", cfg.far_interpol_scale, cfg.far_interpol_scale);
+    nh.param("/max_interpol_scale", cfg.max_interpol_scale, cfg.max_interpol_scale);
+    nh.param("/interpol_steepness", cfg.interpol_steepness, cfg.interpol_steepness);
 
     XmlRpc::XmlRpcValue param;
     if (nh.getParam("/matrix_file/tlc", param) && param.size() == 3) {
         Tlc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]);
-        ROS_INFO("Loaded Tlc: \n%s", Tlc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
+        ROS_INFO("Loaded Tlc: \n%s", eigenToString(Tlc).c_str());
     } else {
         ROS_WARN("Invalid Tlc, using default");
         Tlc << 0.0, 0.0, 0.0;
@@ -120,7 +133,7 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
             ROS_WARN("Rlc is not a valid rotation matrix, using identity");
             Rlc.setIdentity();
         }
-        ROS_INFO("Loaded Rlc: \n%s", Rlc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
+        ROS_INFO("Loaded Rlc: \n%s", eigenToString(Rlc).c_str());
     } else {
         ROS_WARN("Invalid Rlc, using identity");
         Rlc.setIdentity();
@@ -130,7 +143,7 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
         Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
               static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]),
               static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]);
-        ROS_INFO("Loaded Mc: \n%s", Mc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
+        ROS_INFO("Loaded Mc: \n%s", eigenToString(Mc).c_str());
     } else {
         ROS_WARN("Invalid camera matrix, using default");
         Mc << 1000.0, 0.0, 640.0,
@@ -141,7 +154,7 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
     if (nh.getParam("/matrix_file/distortion_coeffs", param) && param.size() == 5) {
         Dc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
               static_cast<double>(param[3]), static_cast<double>(param[4]);
-        ROS_INFO("Loaded Dc: \n%s", Dc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
+        ROS_INFO("Loaded Dc: \n%s", eigenToString(Dc).c_str());
     } else {
         ROS_WARN("Invalid distortion coefficients, using zeros");
         Dc.setZero();
@@ -208,17 +221,17 @@ void createRangeImage(const PointCloud::Ptr& cloud, const Config& cfg) {
         0.0f,
         0
     );
-    ROS_DEBUG("Created range image: %d x %d", rangeImage->width, rangeImage->height);
+    ROS_DEBUG("Created range image: %u x %u", rangeImage->width, rangeImage->height);
 }
 
-// Function to interpolate depth image with adaptive density for far regions
+// Function to interpolate depth image with enhanced far-region density
 void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     arma::mat Z(rangeImage->height, rangeImage->width, fill::zeros);
     arma::mat Zz(rangeImage->height, rangeImage->width, fill::zeros);
 
     // Populate depth and height matrices
-    for (int i = 0; i < rangeImage->width; ++i) {
-        for (int j = 0; j < rangeImage->height; ++j) {
+    for (unsigned int i = 0; i < rangeImage->width; ++i) {
+        for (unsigned int j = 0; j < rangeImage->height; ++j) {
             float r = rangeImage->getPoint(i, j).range;
             float zz = rangeImage->getPoint(i, j).z;
             if (std::isinf(r) || std::isnan(zz) || r < cfg.minlen || r > cfg.maxlen) {
@@ -229,12 +242,23 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
     }
 
-    // Adaptive interpolation based on depth
+    // Adaptive interpolation with non-linear step size
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
 
-    // Compute maximum output size based on far region interpolation
-    double min_step = 1.0 / cfg.interpol_value * cfg.far_interpol_scale;
+    // Compute depth-dependent step size using logistic function
+    auto compute_step_size = [&](double depth) {
+        if (depth <= cfg.far_depth_threshold) {
+            return 1.0 / cfg.interpol_value;
+        }
+        double t = (depth - cfg.far_depth_threshold) * cfg.interpol_steepness;
+        double scale = cfg.far_interpol_scale + (cfg.max_interpol_scale - cfg.far_interpol_scale) /
+                       (1.0 + std::exp(-t));
+        return 1.0 / cfg.interpol_value * scale;
+    };
+
+    // Estimate maximum output size
+    double min_step = compute_step_size(cfg.maxlen);
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
     arma::vec YI = arma::regspace(Y.min(), min_step, Y.max());
 
@@ -242,36 +266,36 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     arma::interp2(X, Y, Z, XI, YI, Z_temp, "linear");
     arma::interp2(X, Y, Zz, XI, YI, Zz_temp, "linear");
 
-    // Initialize output matrices with increased size for far regions
+    // Initialize output matrices
     ZI.zeros(YI.n_elem, XI.n_elem);
     ZzI.zeros(YI.n_elem, XI.n_elem);
 
     // Copy initial interpolation
-    for (uint i = 0; i < Z_temp.n_rows && i < ZI.n_rows; ++i) {
-        for (uint j = 0; j < Z_temp.n_cols && j < ZI.n_cols; ++j) {
+    for (uword i = 0; i < Z_temp.n_rows && i < ZI.n_rows; ++i) {
+        for (uword j = 0; j < Z_temp.n_cols && j < ZI.n_cols; ++j) {
             ZI(i, j) = Z_temp(i, j);
             ZzI(i, j) = Zz_temp(i, j);
         }
     }
 
-    // Adaptive interpolation for far regions using Gaussian weighting
+    // Depth-weighted Gaussian interpolation
     double sigma_spatial = 2.0;
     double sigma_depth = cfg.maxlen / 10.0;
     double density_threshold = 0.05;
     int max_window_size = 9;
     int min_window_size = 3;
 
-    auto interpolate_region = [&](arma::mat& Z_out, const arma::mat& Z_in, uint start_row, uint end_row) {
-        for (uint i = start_row; i < end_row && i < Z_out.n_rows - 1; ++i) {
-            for (uint j = 1; j < Z_out.n_cols - 1; ++j) {
+    auto interpolate_region = [&](arma::mat& Z_out, const arma::mat& Z_in, uword start_row, uword end_row) {
+        for (uword i = start_row; i < end_row && i < Z_out.n_rows - 1; ++i) {
+            for (uword j = 1; j < Z_out.n_cols - 1; ++j) {
                 if (Z_out(i, j) == 0 || Z_out(i, j) > cfg.far_depth_threshold) {
                     // Compute local density
                     int valid_neighbors = 0;
                     for (int di = -1; di <= 1; ++di) {
                         for (int dj = -1; dj <= 1; ++dj) {
-                            int ni = i + di;
-                            int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
+                            uword ni = i + di;
+                            uword nj = j + dj;
+                            if (ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
                                 valid_neighbors++;
                             }
                         }
@@ -285,13 +309,15 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
 
                     for (int di = -window_size; di <= window_size; ++di) {
                         for (int dj = -window_size; dj <= window_size; ++dj) {
-                            int ni = i + di;
-                            int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
+                            uword ni = i + di;
+                            uword nj = j + dj;
+                            if (ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
                                 double spatial_dist = std::sqrt(di * di + dj * dj);
                                 double depth_dist = std::abs(Z_out(ni, nj) - Z_out(i, j));
-                                double weight = std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_spatial * sigma_spatial) -
-                                                         (depth_dist * depth_dist) / (2 * sigma_depth * sigma_depth));
+                                // Increase weight for far points
+                                double depth_weight = Z_out(ni, nj) > cfg.far_depth_threshold ? 1.5 : 1.0;
+                                double weight = depth_weight * std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_spatial * sigma_spatial) -
+                                                                       (depth_dist * depth_dist) / (2 * sigma_depth * sigma_depth));
                                 weighted_sum += Z_out(ni, nj) * weight;
                                 weight_total += weight;
                             }
@@ -306,13 +332,13 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
     };
 
-    // Parallelize interpolation for large matrices
+    // Parallelize interpolation
     uint num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
-    uint rows_per_thread = ZI.n_rows / num_threads;
+    uword rows_per_thread = ZI.n_rows / num_threads;
     for (uint t = 0; t < num_threads; ++t) {
-        uint start_row = t * rows_per_thread;
-        uint end_row = (t == num_threads - 1) ? ZI.n_rows : start_row + rows_per_thread;
+        uword start_row = t * rows_per_thread;
+        uword end_row = (t == num_threads - 1) ? ZI.n_rows : start_row + rows_per_thread;
         threads.emplace_back(interpolate_region, std::ref(ZI), std::ref(Z_temp), start_row, end_row);
         threads.emplace_back(interpolate_region, std::ref(ZzI), std::ref(Zz_temp), start_row, end_row);
     }
@@ -325,8 +351,8 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
 
-    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
+    for (uword i = 1; i < ZI.n_rows - 1; ++i) {
+        for (uword j = 1; j < ZI.n_cols - 1; ++j) {
             if (ZI(i, j) > 0) {
                 grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
                 grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
@@ -337,8 +363,8 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
 
     double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
     arma::mat Zenhanced = ZI;
-    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
+    for (uword i = 1; i < ZI.n_rows - 1; ++i) {
+        for (uword j = 1; j < ZI.n_cols - 1; ++j) {
             if (grad_mag(i, j) > edge_threshold) {
                 double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
                 Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
@@ -350,20 +376,20 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     if (cfg.filter_pc) {
         // Variance-based filtering
         arma::mat Zout = ZI;
-        for (uint i = 0; i < (ZI.n_rows - 1) / cfg.interpol_value; ++i) {
-            for (uint j = 0; j < ZI.n_cols - 5; ++j) {
+        for (uword i = 0; i < (ZI.n_rows - 1) / cfg.interpol_value; ++i) {
+            for (uword j = 0; j < ZI.n_cols - 5; ++j) {
                 double promedio = 0;
                 double varianza = 0;
-                for (uint k = 0; k < cfg.interpol_value; ++k) {
+                for (uword k = 0; k < cfg.interpol_value; ++k) {
                     promedio += ZI(i * cfg.interpol_value + k, j);
                 }
                 promedio /= cfg.interpol_value;
 
-                for (uint l = 0; l < cfg.interpol_value; ++l) {
+                for (uword l = 0; l < cfg.interpol_value; ++l) {
                     varianza += std::pow(ZI(i * cfg.interpol_value + l, j) - promedio, 2.0);
                 }
                 if (varianza > cfg.max_var) {
-                    for (uint m = 0; m < cfg.interpol_value; ++m) {
+                    for (uword m = 0; m < cfg.interpol_value; ++m) {
                         Zout(i * cfg.interpol_value + m, j) = 0;
                     }
                 }
@@ -393,8 +419,8 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
                     0, 1, 0,
                     -std::sin(ang_x_lidar), 0, std::cos(ang_x_lidar);
 
-    for (uint i = 0; i < ZI.n_rows - cfg.interpol_value; ++i) {
-        for (uint j = 0; j < ZI.n_cols; ++j) {
+    for (uword i = 0; i < ZI.n_rows - cfg.interpol_value; ++i) {
+        for (uword j = 0; j < ZI.n_cols; ++j) {
             float ang = M_PI - (2.0 * M_PI * j) / ZI.n_cols;
             if (ang < cfg.min_FOV - M_PI / 2.0 || ang > cfg.max_FOV - M_PI / 2.0) {
                 continue;
@@ -457,10 +483,10 @@ void projectPointCloudToImage(
     for (size_t i = 0; i < point_cloud->points.size(); ++i) {
         float px = points_2d[i].x;
         float py = points_2d[i].y;
-        int px_data = static_cast<int>(px);
-        int py_data = static_cast<int>(py);
+        unsigned int px_data = static_cast<unsigned int>(px);
+        unsigned int py_data = static_cast<unsigned int>(py);
 
-        if (px_data < 0 || px_data >= cols - 1 || py_data < 0 || py_data >= rows - 1) {
+        if (px_data >= cols - 1 || py_data >= rows - 1) {
             continue;
         }
 
