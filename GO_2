@@ -51,9 +51,8 @@ struct Config {
     double max_var = 50.0;
     float interpol_value = 20.0f;
     float far_depth_threshold = 50.0f;
-    float far_interpol_scale = 0.5f;
-    float max_interpol_scale = 0.2f;
-    float interpol_steepness = 0.1f;
+    float far_interpol_scale = 0.1f; // Denser interpolation (10x)
+    float interpol_steepness = 0.2f; // Sharper transition
     bool filter_pc = true;
     float voxel_leaf_size = 0.1f;
     int sor_mean_k = 50;
@@ -64,6 +63,8 @@ struct Config {
     bool use_intensity_color = false;
     std::string imgTopic = "/camera/color/image_raw";
     std::string pcTopic = "/velodyne_points";
+    std::string camera_frame = "camera";
+    std::string lidar_frame = "velodyne";
 };
 
 // Calibration Matrices
@@ -113,8 +114,9 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
     nh.param("/use_intensity_color", cfg.use_intensity_color, cfg.use_intensity_color);
     nh.param("/far_depth_threshold", cfg.far_depth_threshold, cfg.far_depth_threshold);
     nh.param("/far_interpol_scale", cfg.far_interpol_scale, cfg.far_interpol_scale);
-    nh.param("/max_interpol_scale", cfg.max_interpol_scale, cfg.max_interpol_scale);
     nh.param("/interpol_steepness", cfg.interpol_steepness, cfg.interpol_steepness);
+    nh.param("/camera_frame", cfg.camera_frame, cfg.camera_frame);
+    nh.param("/lidar_frame", cfg.lidar_frame, cfg.lidar_frame);
 
     XmlRpc::XmlRpcValue param;
     if (nh.getParam("/matrix_file/tlc", param) && param.size() == 3) {
@@ -242,7 +244,7 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
     }
 
-    // Adaptive interpolation with non-linear step size
+    // Simplified bilinear interpolation with enhanced far-range density
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
 
@@ -252,156 +254,41 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
             return 1.0 / cfg.interpol_value;
         }
         double t = (depth - cfg.far_depth_threshold) * cfg.interpol_steepness;
-        double scale = cfg.far_interpol_scale + (cfg.max_interpol_scale - cfg.far_interpol_scale) /
-                       (1.0 + std::exp(-t));
-        return 1.0 / cfg.interpol_value * scale;
+        double scale = cfg.far_interpol_scale / (1.0 + std::exp(-t));
+        return scale / cfg.interpol_value;
     };
 
-    // Estimate maximum output size
+    // Estimate output size with denser far-range interpolation
     double min_step = compute_step_size(cfg.maxlen);
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
     arma::vec YI = arma::regspace(Y.min(), min_step, Y.max());
 
-    arma::mat Z_temp, Zz_temp;
-    arma::interp2(X, Y, Z, XI, YI, Z_temp, "linear");
-    arma::interp2(X, Y, Zz, XI, YI, Zz_temp, "linear");
+    // Perform bilinear interpolation
+    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
+    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
 
-    // Initialize output matrices
-    ZI.zeros(YI.n_elem, XI.n_elem);
-    ZzI.zeros(YI.n_elem, XI.n_elem);
-
-    // Copy initial interpolation
-    for (uword i = 0; i < Z_temp.n_rows && i < ZI.n_rows; ++i) {
-        for (uword j = 0; j < Z_temp.n_cols && j < ZI.n_cols; ++j) {
-            ZI(i, j) = Z_temp(i, j);
-            ZzI(i, j) = Zz_temp(i, j);
-        }
-    }
-
-    // Depth-weighted Gaussian interpolation
-    double sigma_spatial = 2.0;
-    double sigma_depth = cfg.maxlen / 10.0;
-    double density_threshold = 0.05;
-    int max_window_size = 9;
-    int min_window_size = 3;
-
-    auto interpolate_region = [&](arma::mat& Z_out, const arma::mat& Z_in, uword start_row, uword end_row) {
-        for (uword i = start_row; i < end_row && i < Z_out.n_rows - 1; ++i) {
-            for (uword j = 1; j < Z_out.n_cols - 1; ++j) {
-                if (Z_out(i, j) == 0 || Z_out(i, j) > cfg.far_depth_threshold) {
-                    // Compute local density
-                    int valid_neighbors = 0;
-                    for (int di = -1; di <= 1; ++di) {
-                        for (int dj = -1; dj <= 1; ++dj) {
-                            uword ni = i + di;
-                            uword nj = j + dj;
-                            if (ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
-                                valid_neighbors++;
-                            }
-                        }
-                    }
-
-                    // Adjust window size based on depth and density
-                    int window_size = (Z_out(i, j) > cfg.far_depth_threshold || valid_neighbors < density_threshold * 9) ?
-                                      max_window_size : min_window_size;
-                    double weighted_sum = 0.0;
-                    double weight_total = 0.0;
-
-                    for (int di = -window_size; di <= window_size; ++di) {
-                        for (int dj = -window_size; dj <= window_size; ++dj) {
-                            uword ni = i + di;
-                            uword nj = j + dj;
-                            if (ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
-                                double spatial_dist = std::sqrt(di * di + dj * dj);
-                                double depth_dist = std::abs(Z_out(ni, nj) - Z_out(i, j));
-                                double depth_weight = Z_out(ni, nj) > cfg.far_depth_threshold ? 1.5 : 1.0;
-                                double weight = depth_weight * std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_spatial * sigma_spatial) -
-                                                                       (depth_dist * depth_dist) / (2 * sigma_depth * sigma_depth));
-                                weighted_sum += Z_out(ni, nj) * weight;
-                                weight_total += weight;
-                            }
-                        }
-                    }
-
-                    if (weight_total > 0) {
-                        Z_out(i, j) = weighted_sum / weight_total;
-                    }
-                }
+    // Highlight far-range points in debug image
+    arma::mat far_mask(ZI.n_rows, ZI.n_cols, fill::zeros);
+    for (uword i = 0; i < ZI.n_rows; ++i) {
+        for (uword j = 0; j < ZI.n_cols; ++j) {
+            if (ZI(i, j) > cfg.far_depth_threshold) {
+                far_mask(i, j) = 255; // Mark far points for visualization
             }
         }
-    };
-
-    // Parallelize interpolation
-    uint num_threads = std::thread::hardware_concurrency();
-    std::vector<std::thread> threads;
-    uword rows_per_thread = ZI.n_rows / num_threads;
-    for (uint t = 0; t < num_threads; ++t) {
-        uword start_row = t * rows_per_thread;
-        uword end_row = (t == num_threads - 1) ? ZI.n_rows : start_row + rows_per_thread;
-        threads.emplace_back(interpolate_region, std::ref(ZI), std::ref(Z_temp), start_row, end_row);
-        threads.emplace_back(interpolate_region, std::ref(ZzI), std::ref(Zz_temp), start_row, end_row);
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    // Edge preservation using bilateral filter
-    arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
-    arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
-    arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
-
-    for (uword i = 1; i < ZI.n_rows - 1; ++i) {
-        for (uword j = 1; j < ZI.n_cols - 1; ++j) {
-            if (ZI(i, j) > 0) {
-                grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
-                grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
-                grad_mag(i, j) = std::sqrt(grad_x(i, j) * grad_x(i, j) + grad_y(i, j) * grad_y(i, j));
-            }
-        }
-    }
-
-    double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
-    arma::mat Zenhanced = ZI;
-    for (uword i = 1; i < ZI.n_rows - 1; ++i) {
-        for (uword j = 1; j < ZI.n_cols - 1; ++j) {
-            if (grad_mag(i, j) > edge_threshold) {
-                double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
-                Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
-            }
-        }
-    }
-    ZI = Zenhanced;
-
-    if (cfg.filter_pc) {
-        // Variance-based filtering
-        arma::mat Zout = ZI;
-        for (uword i = 0; i < (ZI.n_rows - 1) / cfg.interpol_value; ++i) {
-            for (uword j = 0; j < ZI.n_cols - 5; ++j) {
-                double promedio = 0;
-                double varianza = 0;
-                for (uword k = 0; k < cfg.interpol_value; ++k) {
-                    promedio += ZI(i * cfg.interpol_value + k, j);
-                }
-                promedio /= cfg.interpol_value;
-
-                for (uword l = 0; l < cfg.interpol_value; ++l) {
-                    varianza += std::pow(ZI(i * cfg.interpol_value + l, j) - promedio, 2.0);
-                }
-                if (varianza > cfg.max_var) {
-                    for (uword m = 0; m < cfg.interpol_value; ++m) {
-                        Zout(i * cfg.interpol_value + m, j) = 0;
-                    }
-                }
-            }
-        }
-        ZI = Zout;
     }
 
     // Publish range image for debugging
     cv::Mat range_img(ZI.n_rows, ZI.n_cols, CV_32F, ZI.memptr());
     cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
+    cv::Mat far_img(far_mask.n_rows, far_mask.n_cols, CV_8U, far_mask.memptr());
     sensor_msgs::ImagePtr range_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", range_img).toImageMsg();
+    sensor_msgs::ImagePtr far_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", far_img).toImageMsg();
+    range_msg->header.frame_id = cfg.camera_frame;
+    far_msg->header.frame_id = cfg.camera_frame;
     range_image_pub.publish(range_msg);
+    // Publish far_mask as a separate topic for debugging
+    static ros::Publisher far_mask_pub = ros::NodeHandle().advertise<sensor_msgs::Image>("/far_range_mask", 1);
+    far_mask_pub.publish(far_msg);
 }
 
 // Function to convert range image to point cloud
@@ -418,7 +305,7 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
                     0, 1, 0,
                     -std::sin(ang_x_lidar), 0, std::cos(ang_x_lidar);
 
-    for (uword i = 0; i < ZI.n_rows - cfg.interpol_value; ++i) {
+    for (uword i = 0; i < ZI.n_rows; ++i) {
         for (uword j = 0; j < ZI.n_cols; ++j) {
             float ang = M_PI - (2.0 * M_PI * j) / ZI.n_cols;
             if (ang < cfg.min_FOV - M_PI / 2.0 || ang > cfg.max_FOV - M_PI / 2.0) {
@@ -470,7 +357,6 @@ void projectPointCloudToImage(
     unsigned int cols = image.cols;
     unsigned int rows = image.rows;
 
-    std::vector<cv::Point2f> points;
     std::vector<cv::Point3f> points_3d;
     for (const auto& point : point_cloud->points) {
         points_3d.emplace_back(-point.y, -point.z, point.x);
@@ -479,13 +365,14 @@ void projectPointCloudToImage(
     std::vector<cv::Point2f> points_2d;
     cv::projectPoints(points_3d, cv::Mat::eye(3, 3, CV_64F), cv::Mat::zeros(3, 1, CV_64F), camera_matrix, dist_coeffs, points_2d);
 
+    int valid_projections = 0;
     for (size_t i = 0; i < point_cloud->points.size(); ++i) {
         float px = points_2d[i].x;
         float py = points_2d[i].y;
         unsigned int px_data = static_cast<unsigned int>(px);
         unsigned int py_data = static_cast<unsigned int>(py);
 
-        if (px_data >= cols - 1 || py_data >= rows - 1) {
+        if (px_data >= cols - 1 || py_data >= rows - 1 || px < 0 || py < 0) {
             continue;
         }
 
@@ -517,16 +404,24 @@ void projectPointCloudToImage(
         int color_value = cfg.use_intensity_color ?
                           static_cast<int>(255 * (point_cloud->points[i].intensity / cfg.maxlen)) :
                           static_cast<int>(255 * (point_cloud->points[i].x / cfg.maxlen));
+        if (color_value < 0) color_value = 0;
+        if (color_value > 255) color_value = 255;
         int color_dis_z = static_cast<int>(255 * (point_cloud->points[i].x / 10.0));
         if (color_dis_z > 255) color_dis_z = 255;
 
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_value, color_dis_z, color_value), cv::FILLED);
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 2, CV_RGB(255 - color_value, color_dis_z, color_value), cv::FILLED);
+        valid_projections++;
     }
 
     pc_color->is_dense = true;
     pc_color->width = pc_color->points.size();
     pc_color->height = 1;
-    pc_color->header.frame_id = "velodyne";
+    pc_color->header.frame_id = cfg.lidar_frame;
+
+    ROS_DEBUG("Projected %d/%zu points onto image", valid_projections, point_cloud->points.size());
+    if (valid_projections == 0) {
+        ROS_WARN("No points projected onto image. Check calibration matrices or input data.");
+    }
 }
 
 // Callback function
@@ -534,8 +429,10 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
     auto start = std::chrono::high_resolution_clock::now();
 
     // Validate timestamps
-    if (std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()) > 0.1) {
-        ROS_WARN("Timestamp mismatch between point cloud and image");
+    if (std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()) > 0.05) {
+        ROS_WARN("Timestamp mismatch: PC %f, Image %f, Diff %f", 
+                 in_pc2->header.stamp.toSec(), in_image->header.stamp.toSec(),
+                 std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()));
         return;
     }
 
@@ -544,6 +441,7 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
     try {
         cv_ptr = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
         color_pcl = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
+        cv_ptr->header.frame_id = cfg.camera_frame;
     } catch (cv_bridge::Exception& e) {
         ROS_ERROR("cv_bridge exception: %s", e.what());
         return;
@@ -563,6 +461,7 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
         ROS_WARN("Empty point cloud received");
         return;
     }
+    msg_pointCloud->header.frame_id = cfg.lidar_frame;
 
     // Filter point cloud
     PointCloud::Ptr cloud_filtered(new PointCloud);
@@ -578,12 +477,15 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
     // Convert range image to point cloud
     PointCloud::Ptr point_cloud(new PointCloud);
     rangeImageToPointCloud(ZI, ZzI, cfg, point_cloud);
+    point_cloud->header.frame_id = cfg.lidar_frame;
 
     // Project point cloud onto image
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
     projectPointCloudToImage(point_cloud, color_pcl->image, cfg, pc_color, cv_ptr);
 
     // Publish results
+    cv_ptr->header.stamp = in_image->header.stamp;
+    pc_color->header.stamp = in_pc2->header.stamp;
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
     pc_pub.publish(pc_color);
 
