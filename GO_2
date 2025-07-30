@@ -9,13 +9,17 @@
 #include <pcl/range_image/range_image_spherical.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/radius_outlier_removal.h>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/calib3d/calib3d.hpp>
 #include <armadillo>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/sync_policies/exact_time.h>
 #include <Eigen/Dense>
 #include <chrono>
+#include <thread>
 #include <stdexcept>
 
 using namespace Eigen;
@@ -29,13 +33,14 @@ typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 // Global Publishers
 ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
+ros::Publisher range_image_pub;
 
 // Configuration Parameters
 struct Config {
-    float maxlen = 100.0f;        // Max LiDAR distance
-    float minlen = 0.01f;         // Min LiDAR distance
-    float max_FOV = 3.0f;         // Max camera FOV (radians)
-    float min_FOV = 0.4f;         // Min camera FOV (radians)
+    float maxlen = 100.0f;
+    float minlen = 0.01f;
+    float max_FOV = 3.0f;
+    float min_FOV = 0.4f;
     float angular_resolution_x = 0.5f;
     float angular_resolution_y = 2.1f;
     float max_angle_width = 360.0f;
@@ -44,22 +49,36 @@ struct Config {
     float min_depth = 8.0f;
     double max_var = 50.0;
     float interpol_value = 20.0f;
+    float far_depth_threshold = 50.0f; // Depth above which to increase interpolation density
+    float far_interpol_scale = 0.5f;   // Scale factor for interpolation step in far regions
     bool filter_pc = true;
     float voxel_leaf_size = 0.1f;
     int sor_mean_k = 50;
     float sor_stddev = 1.0f;
+    float radius_search = 0.5f;
+    int min_neighbors = 5;
+    bool use_exact_sync = false;
+    bool use_intensity_color = false;
     std::string imgTopic = "/camera/color/image_raw";
     std::string pcTopic = "/velodyne_points";
 };
 
 // Calibration Matrices
-Eigen::MatrixXf Tlc(3, 1); // Translation matrix lidar-camera
-Eigen::MatrixXf Rlc(3, 3); // Rotation matrix lidar-camera
-Eigen::MatrixXf Mc(3, 4);  // Camera calibration matrix
+Eigen::MatrixXf Tlc(3, 1);
+Eigen::MatrixXf Rlc(3, 3);
+Eigen::MatrixXf Mc(3, 3);
+Eigen::MatrixXf Dc(1, 5);
 
 // Range Image
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
+
+// Function to validate rotation matrix
+bool isValidRotationMatrix(const Eigen::Matrix3f& R) {
+    Eigen::Matrix3f shouldBeIdentity = R * R.transpose();
+    Eigen::Matrix3f I = Eigen::Matrix3f::Identity();
+    return (shouldBeIdentity - I).norm() < 1e-6;
+}
 
 // Function to load ROS parameters
 void loadParameters(ros::NodeHandle& nh, Config& cfg) {
@@ -77,34 +96,55 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
     nh.param("/voxel_leaf_size", cfg.voxel_leaf_size, cfg.voxel_leaf_size);
     nh.param("/sor_mean_k", cfg.sor_mean_k, cfg.sor_mean_k);
     nh.param("/sor_stddev", cfg.sor_stddev, cfg.sor_stddev);
+    nh.param("/radius_search", cfg.radius_search, cfg.radius_search);
+    nh.param("/min_neighbors", cfg.min_neighbors, cfg.min_neighbors);
+    nh.param("/use_exact_sync", cfg.use_exact_sync, cfg.use_exact_sync);
+    nh.param("/use_intensity_color", cfg.use_intensity_color, cfg.use_intensity_color);
+    nh.param("/far_depth_threshold", cfg.far_depth_threshold, cfg.far_depth_threshold);
+    nh.param("/far_interpol_scale", cfg.far_interpol_scale, cfg.far_interpol_scale);
 
     XmlRpc::XmlRpcValue param;
     if (nh.getParam("/matrix_file/tlc", param) && param.size() == 3) {
         Tlc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]);
         ROS_INFO("Loaded Tlc: \n%s", Tlc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
     } else {
-        ROS_ERROR("Failed to load Tlc matrix");
-        throw std::runtime_error("Invalid Tlc matrix");
+        ROS_WARN("Invalid Tlc, using default");
+        Tlc << 0.0, 0.0, 0.0;
     }
 
     if (nh.getParam("/matrix_file/rlc", param) && param.size() == 9) {
         Rlc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
                static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]),
                static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]);
+        if (!isValidRotationMatrix(Rlc)) {
+            ROS_WARN("Rlc is not a valid rotation matrix, using identity");
+            Rlc.setIdentity();
+        }
         ROS_INFO("Loaded Rlc: \n%s", Rlc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
     } else {
-        ROS_ERROR("Failed to load Rlc matrix");
-        throw std::runtime_error("Invalid Rlc matrix");
+        ROS_WARN("Invalid Rlc, using identity");
+        Rlc.setIdentity();
     }
 
-    if (nh.getParam("/matrix_file/camera_matrix", param) && param.size() == 12) {
-        Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]), static_cast<double>(param[3]),
-              static_cast<double>(param[4]), static_cast<double>(param[5]), static_cast<double>(param[6]), static_cast<double>(param[7]),
-              static_cast<double>(param[8]), static_cast<double>(param[9]), static_cast<double>(param[10]), static_cast<double>(param[11]);
+    if (nh.getParam("/matrix_file/camera_matrix", param) && param.size() == 9) {
+        Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
+              static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]),
+              static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]);
         ROS_INFO("Loaded Mc: \n%s", Mc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
     } else {
-        ROS_ERROR("Failed to load camera matrix");
-        throw std::runtime_error("Invalid camera matrix");
+        ROS_WARN("Invalid camera matrix, using default");
+        Mc << 1000.0, 0.0, 640.0,
+              0.0, 1000.0, 360.0,
+              0.0, 0.0, 1.0;
+    }
+
+    if (nh.getParam("/matrix_file/distortion_coeffs", param) && param.size() == 5) {
+        Dc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
+              static_cast<double>(param[3]), static_cast<double>(param[4]);
+        ROS_INFO("Loaded Dc: \n%s", Dc.format(IOFormat(4, 0, ", ", "\n", "[", "]")).c_str());
+    } else {
+        ROS_WARN("Invalid distortion coefficients, using zeros");
+        Dc.setZero();
     }
 }
 
@@ -142,6 +182,15 @@ void filterPointCloud(const PointCloud::Ptr& cloud_in, PointCloud::Ptr& cloud_ou
     sor.filter(*temp_cloud);
     cloud_out->swap(*temp_cloud);
     ROS_DEBUG("After SOR filter, points: %zu", cloud_out->points.size());
+
+    // Radius Outlier Removal
+    pcl::RadiusOutlierRemoval<pcl::PointXYZI> ror;
+    ror.setInputCloud(cloud_out);
+    ror.setRadiusSearch(cfg.radius_search);
+    ror.setMinNeighborsInRadius(cfg.min_neighbors);
+    ror.filter(*temp_cloud);
+    cloud_out->swap(*temp_cloud);
+    ROS_DEBUG("After ROR filter, points: %zu", cloud_out->points.size());
 }
 
 // Function to create range image
@@ -162,11 +211,12 @@ void createRangeImage(const PointCloud::Ptr& cloud, const Config& cfg) {
     ROS_DEBUG("Created range image: %d x %d", rangeImage->width, rangeImage->height);
 }
 
-// Function to interpolate depth image
+// Function to interpolate depth image with adaptive density for far regions
 void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     arma::mat Z(rangeImage->height, rangeImage->width, fill::zeros);
     arma::mat Zz(rangeImage->height, rangeImage->width, fill::zeros);
 
+    // Populate depth and height matrices
     for (int i = 0; i < rangeImage->width; ++i) {
         for (int j = 0; j < rangeImage->height; ++j) {
             float r = rangeImage->getPoint(i, j).range;
@@ -179,59 +229,98 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
     }
 
+    // Adaptive interpolation based on depth
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
+
+    // Compute maximum output size based on far region interpolation
+    double min_step = 1.0 / cfg.interpol_value * cfg.far_interpol_scale;
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-    arma::vec YI = arma::regspace(Y.min(), 1.0 / cfg.interpol_value, Y.max());
+    arma::vec YI = arma::regspace(Y.min(), min_step, Y.max());
 
-    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
-    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
+    arma::mat Z_temp, Zz_temp;
+    arma::interp2(X, Y, Z, XI, YI, Z_temp, "linear");
+    arma::interp2(X, Y, Zz, XI, YI, Zz_temp, "linear");
 
-    // Adaptive interpolation for missing data
-    arma::mat Zout = ZI;
+    // Initialize output matrices with increased size for far regions
+    ZI.zeros(YI.n_elem, XI.n_elem);
+    ZzI.zeros(YI.n_elem, XI.n_elem);
+
+    // Copy initial interpolation
+    for (uint i = 0; i < Z_temp.n_rows && i < ZI.n_rows; ++i) {
+        for (uint j = 0; j < Z_temp.n_cols && j < ZI.n_cols; ++j) {
+            ZI(i, j) = Z_temp(i, j);
+            ZzI(i, j) = Zz_temp(i, j);
+        }
+    }
+
+    // Adaptive interpolation for far regions using Gaussian weighting
+    double sigma_spatial = 2.0;
+    double sigma_depth = cfg.maxlen / 10.0;
     double density_threshold = 0.05;
     int max_window_size = 9;
     int min_window_size = 3;
 
-    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
-        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
-            if (ZI(i, j) == 0) {
-                int valid_neighbors = 0;
-                for (int di = -1; di <= 1; ++di) {
-                    for (int dj = -1; dj <= 1; ++dj) {
-                        int ni = i + di;
-                        int nj = j + dj;
-                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
-                            valid_neighbors++;
+    auto interpolate_region = [&](arma::mat& Z_out, const arma::mat& Z_in, uint start_row, uint end_row) {
+        for (uint i = start_row; i < end_row && i < Z_out.n_rows - 1; ++i) {
+            for (uint j = 1; j < Z_out.n_cols - 1; ++j) {
+                if (Z_out(i, j) == 0 || Z_out(i, j) > cfg.far_depth_threshold) {
+                    // Compute local density
+                    int valid_neighbors = 0;
+                    for (int di = -1; di <= 1; ++di) {
+                        for (int dj = -1; dj <= 1; ++dj) {
+                            int ni = i + di;
+                            int nj = j + dj;
+                            if (ni >= 0 && nj >= 0 && ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
+                                valid_neighbors++;
+                            }
                         }
                     }
-                }
 
-                int window_size = (valid_neighbors < density_threshold * 9) ? max_window_size : min_window_size;
-                double weighted_sum = 0.0;
-                double weight_total = 0.0;
+                    // Adjust window size based on depth and density
+                    int window_size = (Z_out(i, j) > cfg.far_depth_threshold || valid_neighbors < density_threshold * 9) ?
+                                      max_window_size : min_window_size;
+                    double weighted_sum = 0.0;
+                    double weight_total = 0.0;
 
-                for (int di = -window_size; di <= window_size; ++di) {
-                    for (int dj = -window_size; dj <= window_size; ++dj) {
-                        int ni = i + di;
-                        int nj = j + dj;
-                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
-                            double distance = std::sqrt(di * di + dj * dj);
-                            double weight = 1.0 / (distance + 1e-6);
-                            weighted_sum += ZI(ni, nj) * weight;
-                            weight_total += weight;
+                    for (int di = -window_size; di <= window_size; ++di) {
+                        for (int dj = -window_size; dj <= window_size; ++dj) {
+                            int ni = i + di;
+                            int nj = j + dj;
+                            if (ni >= 0 && nj >= 0 && ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
+                                double spatial_dist = std::sqrt(di * di + dj * dj);
+                                double depth_dist = std::abs(Z_out(ni, nj) - Z_out(i, j));
+                                double weight = std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_spatial * sigma_spatial) -
+                                                         (depth_dist * depth_dist) / (2 * sigma_depth * sigma_depth));
+                                weighted_sum += Z_out(ni, nj) * weight;
+                                weight_total += weight;
+                            }
                         }
                     }
-                }
 
-                if (weight_total > 0) {
-                    ZI(i, j) = weighted_sum / weight_total;
+                    if (weight_total > 0) {
+                        Z_out(i, j) = weighted_sum / weight_total;
+                    }
                 }
             }
         }
+    };
+
+    // Parallelize interpolation for large matrices
+    uint num_threads = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    uint rows_per_thread = ZI.n_rows / num_threads;
+    for (uint t = 0; t < num_threads; ++t) {
+        uint start_row = t * rows_per_thread;
+        uint end_row = (t == num_threads - 1) ? ZI.n_rows : start_row + rows_per_thread;
+        threads.emplace_back(interpolate_region, std::ref(ZI), std::ref(Z_temp), start_row, end_row);
+        threads.emplace_back(interpolate_region, std::ref(ZzI), std::ref(Zz_temp), start_row, end_row);
+    }
+    for (auto& thread : threads) {
+        thread.join();
     }
 
-    // Edge preservation
+    // Edge preservation using bilateral filter
     arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
@@ -260,6 +349,7 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
 
     if (cfg.filter_pc) {
         // Variance-based filtering
+        arma::mat Zout = ZI;
         for (uint i = 0; i < (ZI.n_rows - 1) / cfg.interpol_value; ++i) {
             for (uint j = 0; j < ZI.n_cols - 5; ++j) {
                 double promedio = 0;
@@ -281,6 +371,12 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
         ZI = Zout;
     }
+
+    // Publish range image for debugging
+    cv::Mat range_img(ZI.n_rows, ZI.n_cols, CV_32F, ZI.memptr());
+    cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
+    sensor_msgs::ImagePtr range_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", range_img).toImageMsg();
+    range_image_pub.publish(range_msg);
 }
 
 // Function to convert range image to point cloud
@@ -317,6 +413,7 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
             point_cloud->points[num_pc].x = result(0);
             point_cloud->points[num_pc].y = result(1);
             point_cloud->points[num_pc].z = result(2);
+            point_cloud->points[num_pc].intensity = ZI(i, j);
             num_pc++;
         }
     }
@@ -324,9 +421,98 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
     ROS_DEBUG("Converted to point cloud with %d points", num_pc);
 }
 
+// Function to project point cloud onto image with sub-pixel accuracy
+void projectPointCloudToImage(
+    const PointCloud::Ptr& point_cloud,
+    const cv::Mat& image,
+    const Config& cfg,
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr& pc_color,
+    cv_bridge::CvImagePtr& cv_ptr
+) {
+    Eigen::Matrix4f RTlc;
+    RTlc << Rlc(0, 0), Rlc(0, 1), Rlc(0, 2), Tlc(0),
+            Rlc(1, 0), Rlc(1, 1), Rlc(1, 2), Tlc(1),
+            Rlc(2, 0), Rlc(2, 1), Rlc(2, 2), Tlc(2),
+            0, 0, 0, 1;
+
+    cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
+        Mc(0, 0), Mc(0, 1), Mc(0, 2),
+        Mc(1, 0), Mc(1, 1), Mc(1, 2),
+        Mc(2, 0), Mc(2, 1), Mc(2, 2));
+    cv::Mat dist_coeffs = (cv::Mat_<double>(1, 5) <<
+        Dc(0), Dc(1), Dc(2), Dc(3), Dc(4));
+
+    unsigned int cols = image.cols;
+    unsigned int rows = image.rows;
+
+    std::vector<cv::Point2f> points;
+    std::vector<cv::Point3f> points_3d;
+    for (const auto& point : point_cloud->points) {
+        points_3d.emplace_back(-point.y, -point.z, point.x);
+    }
+
+    std::vector<cv::Point2f> points_2d;
+    cv::projectPoints(points_3d, cv::Mat::eye(3, 3, CV_64F), cv::Mat::zeros(3, 1, CV_64F), camera_matrix, dist_coeffs, points_2d);
+
+    for (size_t i = 0; i < point_cloud->points.size(); ++i) {
+        float px = points_2d[i].x;
+        float py = points_2d[i].y;
+        int px_data = static_cast<int>(px);
+        int py_data = static_cast<int>(py);
+
+        if (px_data < 0 || px_data >= cols - 1 || py_data < 0 || py_data >= rows - 1) {
+            continue;
+        }
+
+        // Bilinear interpolation for color
+        float fx = px - px_data;
+        float fy = py - py_data;
+        cv::Vec3b c00 = image.at<cv::Vec3b>(py_data, px_data);
+        cv::Vec3b c01 = image.at<cv::Vec3b>(py_data, px_data + 1);
+        cv::Vec3b c10 = image.at<cv::Vec3b>(py_data + 1, px_data);
+        cv::Vec3b c11 = image.at<cv::Vec3b>(py_data + 1, px_data + 1);
+
+        cv::Vec3f color;
+        for (int k = 0; k < 3; ++k) {
+            color[k] = (1 - fx) * (1 - fy) * c00[k] +
+                       fx * (1 - fy) * c01[k] +
+                       (1 - fx) * fy * c10[k] +
+                       fx * fy * c11[k];
+        }
+
+        pcl::PointXYZRGB point;
+        point.x = point_cloud->points[i].x;
+        point.y = point_cloud->points[i].y;
+        point.z = point_cloud->points[i].z;
+        point.r = static_cast<uint8_t>(color[2]);
+        point.g = static_cast<uint8_t>(color[1]);
+        point.b = static_cast<uint8_t>(color[0]);
+        pc_color->points.push_back(point);
+
+        int color_value = cfg.use_intensity_color ?
+                          static_cast<int>(255 * (point_cloud->points[i].intensity / cfg.maxlen)) :
+                          static_cast<int>(255 * (point_cloud->points[i].x / cfg.maxlen));
+        int color_dis_z = static_cast<int>(255 * (point_cloud->points[i].x / 10.0));
+        if (color_dis_z > 255) color_dis_z = 255;
+
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_value, color_dis_z, color_value), cv::FILLED);
+    }
+
+    pc_color->is_dense = true;
+    pc_color->width = pc_color->points.size();
+    pc_color->height = 1;
+    pc_color->header.frame_id = "velodyne";
+}
+
 // Callback function
 void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, const Config& cfg) {
     auto start = std::chrono::high_resolution_clock::now();
+
+    // Validate timestamps
+    if (std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()) > 0.1) {
+        ROS_WARN("Timestamp mismatch between point cloud and image");
+        return;
+    }
 
     // Convert image to OpenCV format
     cv_bridge::CvImagePtr cv_ptr, color_pcl;
@@ -335,6 +521,11 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
         color_pcl = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
     } catch (cv_bridge::Exception& e) {
         ROS_ERROR("cv_bridge exception: %s", e.what());
+        return;
+    }
+
+    if (cv_ptr->image.empty()) {
+        ROS_WARN("Empty image received");
         return;
     }
 
@@ -364,53 +555,8 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
     rangeImageToPointCloud(ZI, ZzI, cfg, point_cloud);
 
     // Project point cloud onto image
-    Eigen::Matrix4f RTlc;
-    RTlc << Rlc(0, 0), Rlc(0, 1), Rlc(0, 2), Tlc(0),
-            Rlc(1, 0), Rlc(1, 1), Rlc(1, 2), Tlc(1),
-            Rlc(2, 0), Rlc(2, 1), Rlc(2, 2), Tlc(2),
-            0, 0, 0, 1;
-
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
-    Eigen::Matrix4f pc_matrix = Eigen::Matrix4f::Zero();
-    pc_matrix(3, 0) = 1.0;
-
-    unsigned int cols = in_image->width;
-    unsigned int rows = in_image->height;
-
-    for (size_t i = 0; i < point_cloud->points.size(); ++i) {
-        pc_matrix(0, 0) = -point_cloud->points[i].y;
-        pc_matrix(1, 0) = -point_cloud->points[i].z;
-        pc_matrix(2, 0) = point_cloud->points[i].x;
-
-        Eigen::Vector3f Lidar_cam = Mc * (RTlc * pc_matrix);
-        int px_data = static_cast<int>(Lidar_cam(0) / Lidar_cam(2));
-        int py_data = static_cast<int>(Lidar_cam(1) / Lidar_cam(2));
-
-        if (px_data < 0 || px_data >= cols || py_data < 0 || py_data >= rows) {
-            continue;
-        }
-
-        int color_dis_x = static_cast<int>(255 * (point_cloud->points[i].x / cfg.maxlen));
-        int color_dis_z = static_cast<int>(255 * (point_cloud->points[i].x / 10.0));
-        if (color_dis_z > 255) color_dis_z = 255;
-
-        cv::Vec3b& color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
-        pcl::PointXYZRGB point;
-        point.x = point_cloud->points[i].x;
-        point.y = point_cloud->points[i].y;
-        point.z = point_cloud->points[i].z;
-        point.r = color[2];
-        point.g = color[1];
-        point.b = color[0];
-        pc_color->points.push_back(point);
-
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_dis_x, color_dis_z, color_dis_x), cv::FILLED);
-    }
-
-    pc_color->is_dense = true;
-    pc_color->width = pc_color->points.size();
-    pc_color->height = 1;
-    pc_color->header.frame_id = "velodyne";
+    projectPointCloudToImage(point_cloud, color_pcl->image, cfg, pc_color, cv_ptr);
 
     // Publish results
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
@@ -435,13 +581,20 @@ int main(int argc, char** argv) {
     rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
     pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
     pc_pub = nh.advertise<PointCloud>("/points2", 1);
+    range_image_pub = nh.advertise<sensor_msgs::Image>("/range_image", 1);
 
     message_filters::Subscriber<PointCloud2> pc_sub(nh, cfg.pcTopic, 1);
     message_filters::Subscriber<Image> img_sub(nh, cfg.imgTopic, 1);
 
-    typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
-    Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
-    sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
+    if (cfg.use_exact_sync) {
+        typedef sync_policies::ExactTime<PointCloud2, Image> MySyncPolicy;
+        Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
+        sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
+    } else {
+        typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
+        Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
+        sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
+    }
 
     ROS_INFO("LiDAR-Camera fusion node started");
     ros::spin();
