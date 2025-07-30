@@ -149,8 +149,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     double density_threshold = 0.05;
     int max_window_size = 9;
     int min_window_size = 3;
+    arma::mat Zout = ZI; // Use existing Zout
 
-    arma::mat Zout = ZI;
     for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
         for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
             if (ZI(i, j) == 0 || ZI(i, j) > far_depth_threshold) {
@@ -191,7 +191,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     }
     ZI = Zout;
 
-    // Restored original edge preservation
+    // Original edge preservation
     arma::mat Zenhanced = ZI;
     arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
@@ -218,9 +218,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     }
     ZI = Zenhanced;
 
-    // Restored original variance-based filtering
+    // Original variance-based filtering
     if (f_pc) {
-        arma::mat Zout = ZI;
         for (unsigned int i = 0; i < ((ZI.n_rows - 1) / interpol_value); i += 1) {
             for (unsigned int j = 0; j < ZI.n_cols - 5; j += 1) {
                 double promedio = 0;
@@ -272,8 +271,6 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     point_cloud->height = ZI.n_rows;
     point_cloud->is_dense = false;
     point_cloud->points.resize(point_cloud->width * point_cloud->height);
-
-    arma::mat Zout = ZI;
 
     int num_pc = 0;
     for (unsigned int i = 0; i < ZI.n_rows - interpol_value; i += 1) {
