@@ -52,8 +52,8 @@ struct Config {
     float interpol_value = 20.0f;
     float far_depth_threshold = 50.0f;
     float far_interpol_scale = 0.5f;
-    float max_interpol_scale = 0.2f; // Maximum step size reduction
-    float interpol_steepness = 0.1f; // Steepness of logistic function
+    float max_interpol_scale = 0.2f;
+    float interpol_steepness = 0.1f;
     bool filter_pc = true;
     float voxel_leaf_size = 0.1f;
     int sor_mean_k = 50;
@@ -232,8 +232,8 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     // Populate depth and height matrices
     for (unsigned int i = 0; i < rangeImage->width; ++i) {
         for (unsigned int j = 0; j < rangeImage->height; ++j) {
-            float r = rangeImage->getPoint(i, j).range;
-            float zz = rangeImage->getPoint(i, j).z;
+            float r = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).range;
+            float zz = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).z;
             if (std::isinf(r) || std::isnan(zz) || r < cfg.minlen || r > cfg.maxlen) {
                 continue;
             }
@@ -314,7 +314,6 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
                             if (ni < Z_out.n_rows && nj < Z_out.n_cols && Z_out(ni, nj) > 0) {
                                 double spatial_dist = std::sqrt(di * di + dj * dj);
                                 double depth_dist = std::abs(Z_out(ni, nj) - Z_out(i, j));
-                                // Increase weight for far points
                                 double depth_weight = Z_out(ni, nj) > cfg.far_depth_threshold ? 1.5 : 1.0;
                                 double weight = depth_weight * std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_spatial * sigma_spatial) -
                                                                        (depth_dist * depth_dist) / (2 * sigma_depth * sigma_depth));
