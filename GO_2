@@ -9,19 +9,14 @@
 #include <pcl/range_image/range_image_spherical.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
-#include <pcl/filters/radius_outlier_removal.h>
 #include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/calib3d/calib3d.hpp>
 #include <armadillo>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
-#include <message_filters/sync_policies/exact_time.h>
 #include <Eigen/Dense>
 #include <sstream>
 #include <chrono>
-#include <thread>
-#include <stdexcept>
 
 using namespace Eigen;
 using namespace sensor_msgs;
@@ -46,21 +41,12 @@ struct Config {
     float angular_resolution_y = 2.1f;
     float max_angle_width = 360.0f;
     float max_angle_height = 180.0f;
-    float max_depth = 100.0f;
-    float min_depth = 8.0f;
     double max_var = 50.0;
     float interpol_value = 20.0f;
     float far_depth_threshold = 50.0f;
-    float far_interpol_scale = 0.1f; // Denser interpolation (10x)
-    float interpol_steepness = 0.2f; // Sharper transition
+    float far_interpol_scale = 0.05f; // 20x denser for far regions
+    float interpol_steepness = 0.3f;  // Sharper transition
     bool filter_pc = true;
-    float voxel_leaf_size = 0.1f;
-    int sor_mean_k = 50;
-    float sor_stddev = 1.0f;
-    float radius_search = 0.5f;
-    int min_neighbors = 5;
-    bool use_exact_sync = false;
-    bool use_intensity_color = false;
     std::string imgTopic = "/camera/color/image_raw";
     std::string pcTopic = "/velodyne_points";
     std::string camera_frame = "camera";
@@ -70,8 +56,8 @@ struct Config {
 // Calibration Matrices
 Eigen::MatrixXf Tlc(3, 1);
 Eigen::MatrixXf Rlc(3, 3);
-Eigen::MatrixXf Mc(3, 3);
-Eigen::MatrixXf Dc(1, 5);
+Eigen::MatrixXf Mc(3, 4);
+Eigen::MatrixXf Dc(1, 5); // Added for potential distortion correction
 
 // Range Image
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
@@ -105,13 +91,6 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
     nh.param("/x_resolution", cfg.angular_resolution_x, cfg.angular_resolution_x);
     nh.param("/y_interpolation", cfg.interpol_value, cfg.interpol_value);
     nh.param("/ang_Y_resolution", cfg.angular_resolution_y, cfg.angular_resolution_y);
-    nh.param("/voxel_leaf_size", cfg.voxel_leaf_size, cfg.voxel_leaf_size);
-    nh.param("/sor_mean_k", cfg.sor_mean_k, cfg.sor_mean_k);
-    nh.param("/sor_stddev", cfg.sor_stddev, cfg.sor_stddev);
-    nh.param("/radius_search", cfg.radius_search, cfg.radius_search);
-    nh.param("/min_neighbors", cfg.min_neighbors, cfg.min_neighbors);
-    nh.param("/use_exact_sync", cfg.use_exact_sync, cfg.use_exact_sync);
-    nh.param("/use_intensity_color", cfg.use_intensity_color, cfg.use_intensity_color);
     nh.param("/far_depth_threshold", cfg.far_depth_threshold, cfg.far_depth_threshold);
     nh.param("/far_interpol_scale", cfg.far_interpol_scale, cfg.far_interpol_scale);
     nh.param("/interpol_steepness", cfg.interpol_steepness, cfg.interpol_steepness);
@@ -141,16 +120,16 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
         Rlc.setIdentity();
     }
 
-    if (nh.getParam("/matrix_file/camera_matrix", param) && param.size() == 9) {
-        Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]),
-              static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]),
-              static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]);
+    if (nh.getParam("/matrix_file/camera_matrix", param) && param.size() >= 9) {
+        Mc << static_cast<double>(param[0]), static_cast<double>(param[1]), static_cast<double>(param[2]), 0.0,
+              static_cast<double>(param[3]), static_cast<double>(param[4]), static_cast<double>(param[5]), 0.0,
+              static_cast<double>(param[6]), static_cast<double>(param[7]), static_cast<double>(param[8]), 0.0;
         ROS_INFO("Loaded Mc: \n%s", eigenToString(Mc).c_str());
     } else {
         ROS_WARN("Invalid camera matrix, using default");
-        Mc << 1000.0, 0.0, 640.0,
-              0.0, 1000.0, 360.0,
-              0.0, 0.0, 1.0;
+        Mc << 1000.0, 0.0, 640.0, 0.0,
+              0.0, 1000.0, 360.0, 0.0,
+              0.0, 0.0, 1.0, 0.0;
     }
 
     if (nh.getParam("/matrix_file/distortion_coeffs", param) && param.size() == 5) {
@@ -165,12 +144,10 @@ void loadParameters(ros::NodeHandle& nh, Config& cfg) {
 
 // Function to filter point cloud
 void filterPointCloud(const PointCloud::Ptr& cloud_in, PointCloud::Ptr& cloud_out, const Config& cfg) {
-    // Remove NaN points
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*cloud_in, *cloud_out, indices);
     ROS_DEBUG("Removed NaN points, remaining: %zu", cloud_out->points.size());
 
-    // Distance-based filtering
     PointCloud::Ptr temp_cloud(new PointCloud);
     for (const auto& point : cloud_out->points) {
         double distance = std::sqrt(point.x * point.x + point.y * point.y);
@@ -180,32 +157,6 @@ void filterPointCloud(const PointCloud::Ptr& cloud_in, PointCloud::Ptr& cloud_ou
     }
     cloud_out->swap(*temp_cloud);
     ROS_DEBUG("After distance filter, points: %zu", cloud_out->points.size());
-
-    // Voxel Grid Downsampling
-    pcl::VoxelGrid<pcl::PointXYZI> voxel;
-    voxel.setInputCloud(cloud_out);
-    voxel.setLeafSize(cfg.voxel_leaf_size, cfg.voxel_leaf_size, cfg.voxel_leaf_size);
-    voxel.filter(*temp_cloud);
-    cloud_out->swap(*temp_cloud);
-    ROS_DEBUG("After voxel filter, points: %zu", cloud_out->points.size());
-
-    // Statistical Outlier Removal
-    pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
-    sor.setInputCloud(cloud_out);
-    sor.setMeanK(cfg.sor_mean_k);
-    sor.setStddevMulThresh(cfg.sor_stddev);
-    sor.filter(*temp_cloud);
-    cloud_out->swap(*temp_cloud);
-    ROS_DEBUG("After SOR filter, points: %zu", cloud_out->points.size());
-
-    // Radius Outlier Removal
-    pcl::RadiusOutlierRemoval<pcl::PointXYZI> ror;
-    ror.setInputCloud(cloud_out);
-    ror.setRadiusSearch(cfg.radius_search);
-    ror.setMinNeighborsInRadius(cfg.min_neighbors);
-    ror.filter(*temp_cloud);
-    cloud_out->swap(*temp_cloud);
-    ROS_DEBUG("After ROR filter, points: %zu", cloud_out->points.size());
 }
 
 // Function to create range image
@@ -226,7 +177,7 @@ void createRangeImage(const PointCloud::Ptr& cloud, const Config& cfg) {
     ROS_DEBUG("Created range image: %u x %u", rangeImage->width, rangeImage->height);
 }
 
-// Function to interpolate depth image with enhanced far-region density
+// Function to interpolate depth image with enhanced far-range density
 void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
     arma::mat Z(rangeImage->height, rangeImage->width, fill::zeros);
     arma::mat Zz(rangeImage->height, rangeImage->width, fill::zeros);
@@ -244,49 +195,113 @@ void interpolateDepthImage(const Config& cfg, arma::mat& ZI, arma::mat& ZzI) {
         }
     }
 
-    // Simplified bilinear interpolation with enhanced far-range density
+    // Depth-dependent interpolation
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
 
-    // Compute depth-dependent step size using logistic function
     auto compute_step_size = [&](double depth) {
         if (depth <= cfg.far_depth_threshold) {
             return 1.0 / cfg.interpol_value;
         }
         double t = (depth - cfg.far_depth_threshold) * cfg.interpol_steepness;
         double scale = cfg.far_interpol_scale / (1.0 + std::exp(-t));
-        return scale / cfg.interpol_value;
+        return scale;
     };
 
-    // Estimate output size with denser far-range interpolation
     double min_step = compute_step_size(cfg.maxlen);
     arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
     arma::vec YI = arma::regspace(Y.min(), min_step, Y.max());
 
-    // Perform bilinear interpolation
     arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
     arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
 
-    // Highlight far-range points in debug image
-    arma::mat far_mask(ZI.n_rows, ZI.n_cols, fill::zeros);
-    for (uword i = 0; i < ZI.n_rows; ++i) {
-        for (uword j = 0; j < ZI.n_cols; ++j) {
-            if (ZI(i, j) > cfg.far_depth_threshold) {
-                far_mask(i, j) = 255; // Mark far points for visualization
+    // Simplified Gaussian interpolation for far regions
+    double density_threshold = 0.05;
+    int max_window_size = 9;
+    int min_window_size = 3;
+
+    arma::mat Zout = ZI;
+    for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
+        for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
+            if (ZI(i, j) == 0 || ZI(i, j) > cfg.far_depth_threshold) {
+                int valid_neighbors = 0;
+                for (int di = -1; di <= 1; ++di) {
+                    for (int dj = -1; dj <= 1; ++dj) {
+                        unsigned int ni = i + di;
+                        unsigned int nj = j + dj;
+                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            valid_neighbors++;
+                        }
+                    }
+                }
+
+                int window_size = (valid_neighbors < density_threshold * 9 || ZI(i, j) > cfg.far_depth_threshold) ?
+                                  max_window_size : min_window_size;
+                double weighted_sum = 0.0;
+                double weight_total = 0.0;
+
+                for (int di = -window_size; di <= window_size; ++di) {
+                    for (int dj = -window_size; dj <= window_size; ++dj) {
+                        unsigned int ni = i + di;
+                        unsigned int nj = j + dj;
+                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            double distance = std::sqrt(di * di + dj * dj);
+                            double weight = ZI(ni, nj) > cfg.far_depth_threshold ? 1.5 / (distance + 1e-6) : 1.0 / (distance + 1e-6);
+                            weighted_sum += ZI(ni, nj) * weight;
+                            weight_total += weight;
+                        }
+                    }
+                }
+
+                if (weight_total > 0) {
+                    Zout(i, j) = weighted_sum / weight_total;
+                }
             }
         }
+    }
+    ZI = Zout;
+
+    // Variance-based filtering (restored from original)
+    if (cfg.filter_pc) {
+        arma::mat Zout = ZI;
+        for (unsigned int i = 0; i < (ZI.n_rows - 1) / cfg.interpol_value; ++i) {
+            for (unsigned int j = 0; j < ZI.n_cols - 5; ++j) {
+                double promedio = 0;
+                double varianza = 0;
+                for (unsigned int k = 0; k < cfg.interpol_value; ++k) {
+                    promedio += ZI(i * cfg.interpol_value + k, j);
+                }
+                promedio /= cfg.interpol_value;
+
+                for (unsigned int l = 0; l < cfg.interpol_value; ++l) {
+                    varianza += std::pow(ZI(i * cfg.interpol_value + l, j) - promedio, 2.0);
+                }
+                if (varianza > cfg.max_var) {
+                    for (unsigned int m = 0; m < cfg.interpol_value; ++m) {
+                        Zout(i * cfg.interpol_value + m, j) = 0;
+                    }
+                }
+            }
+        }
+        ZI = Zout;
     }
 
     // Publish range image for debugging
     cv::Mat range_img(ZI.n_rows, ZI.n_cols, CV_32F, ZI.memptr());
     cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
-    cv::Mat far_img(far_mask.n_rows, far_mask.n_cols, CV_8U, far_mask.memptr());
+    cv::Mat far_mask(ZI.n_rows, ZI.n_cols, CV_8U, cv::Scalar(0));
+    for (unsigned int i = 0; i < ZI.n_rows; ++i) {
+        for (unsigned int j = 0; j < ZI.n_cols; ++j) {
+            if (ZI(i, j) > cfg.far_depth_threshold) {
+                far_mask.at<uint8_t>(i, j) = 255;
+            }
+        }
+    }
     sensor_msgs::ImagePtr range_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", range_img).toImageMsg();
-    sensor_msgs::ImagePtr far_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", far_img).toImageMsg();
+    sensor_msgs::ImagePtr far_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", far_mask).toImageMsg();
     range_msg->header.frame_id = cfg.camera_frame;
     far_msg->header.frame_id = cfg.camera_frame;
     range_image_pub.publish(range_msg);
-    // Publish far_mask as a separate topic for debugging
     static ros::Publisher far_mask_pub = ros::NodeHandle().advertise<sensor_msgs::Image>("/far_range_mask", 1);
     far_mask_pub.publish(far_msg);
 }
@@ -305,8 +320,8 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
                     0, 1, 0,
                     -std::sin(ang_x_lidar), 0, std::cos(ang_x_lidar);
 
-    for (uword i = 0; i < ZI.n_rows; ++i) {
-        for (uword j = 0; j < ZI.n_cols; ++j) {
+    for (unsigned int i = 0; i < ZI.n_rows - cfg.interpol_value; ++i) {
+        for (unsigned int j = 0; j < ZI.n_cols; ++j) {
             float ang = M_PI - (2.0 * M_PI * j) / ZI.n_cols;
             if (ang < cfg.min_FOV - M_PI / 2.0 || ang > cfg.max_FOV - M_PI / 2.0) {
                 continue;
@@ -333,7 +348,7 @@ void rangeImageToPointCloud(const arma::mat& ZI, const arma::mat& ZzI, const Con
     ROS_DEBUG("Converted to point cloud with %d points", num_pc);
 }
 
-// Function to project point cloud onto image with sub-pixel accuracy
+// Function to project point cloud onto image
 void projectPointCloudToImage(
     const PointCloud::Ptr& point_cloud,
     const cv::Mat& image,
@@ -347,69 +362,41 @@ void projectPointCloudToImage(
             Rlc(2, 0), Rlc(2, 1), Rlc(2, 2), Tlc(2),
             0, 0, 0, 1;
 
-    cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) <<
-        Mc(0, 0), Mc(0, 1), Mc(0, 2),
-        Mc(1, 0), Mc(1, 1), Mc(1, 2),
-        Mc(2, 0), Mc(2, 1), Mc(2, 2));
-    cv::Mat dist_coeffs = (cv::Mat_<double>(1, 5) <<
-        Dc(0), Dc(1), Dc(2), Dc(3), Dc(4));
-
     unsigned int cols = image.cols;
     unsigned int rows = image.rows;
 
-    std::vector<cv::Point3f> points_3d;
-    for (const auto& point : point_cloud->points) {
-        points_3d.emplace_back(-point.y, -point.z, point.x);
-    }
-
-    std::vector<cv::Point2f> points_2d;
-    cv::projectPoints(points_3d, cv::Mat::eye(3, 3, CV_64F), cv::Mat::zeros(3, 1, CV_64F), camera_matrix, dist_coeffs, points_2d);
-
+    Eigen::MatrixXf pc_matrix(4, 1);
+    Eigen::MatrixXf Lidar_cam(3, 1);
     int valid_projections = 0;
-    for (size_t i = 0; i < point_cloud->points.size(); ++i) {
-        float px = points_2d[i].x;
-        float py = points_2d[i].y;
-        unsigned int px_data = static_cast<unsigned int>(px);
-        unsigned int py_data = static_cast<unsigned int>(py);
 
-        if (px_data >= cols - 1 || py_data >= rows - 1 || px < 0 || py < 0) {
+    for (const auto& point : point_cloud->points) {
+        pc_matrix << -point.y, -point.z, point.x, 1.0;
+        Lidar_cam = Mc * (RTlc * pc_matrix);
+
+        unsigned int px_data = static_cast<unsigned int>(Lidar_cam(0, 0) / Lidar_cam(2, 0));
+        unsigned int py_data = static_cast<unsigned int>(Lidar_cam(1, 0) / Lidar_cam(2, 0));
+
+        if (px_data >= cols || py_data >= rows || px_data < 0 || py_data < 0) {
             continue;
         }
 
-        // Bilinear interpolation for color
-        float fx = px - px_data;
-        float fy = py - py_data;
-        cv::Vec3b c00 = image.at<cv::Vec3b>(py_data, px_data);
-        cv::Vec3b c01 = image.at<cv::Vec3b>(py_data, px_data + 1);
-        cv::Vec3b c10 = image.at<cv::Vec3b>(py_data + 1, px_data);
-        cv::Vec3b c11 = image.at<cv::Vec3b>(py_data + 1, px_data + 1);
+        cv::Vec3b color = image.at<cv::Vec3b>(py_data, px_data);
+        pcl::PointXYZRGB rgb_point;
+        rgb_point.x = point.x;
+        rgb_point.y = point.y;
+        rgb_point.z = point.z;
+        rgb_point.r = color[2];
+        rgb_point.g = color[1];
+        rgb_point.b = color[0];
+        pc_color->points.push_back(rgb_point);
 
-        cv::Vec3f color;
-        for (int k = 0; k < 3; ++k) {
-            color[k] = (1 - fx) * (1 - fy) * c00[k] +
-                       fx * (1 - fy) * c01[k] +
-                       (1 - fx) * fy * c10[k] +
-                       fx * fy * c11[k];
-        }
-
-        pcl::PointXYZRGB point;
-        point.x = point_cloud->points[i].x;
-        point.y = point_cloud->points[i].y;
-        point.z = point_cloud->points[i].z;
-        point.r = static_cast<uint8_t>(color[2]);
-        point.g = static_cast<uint8_t>(color[1]);
-        point.b = static_cast<uint8_t>(color[0]);
-        pc_color->points.push_back(point);
-
-        int color_value = cfg.use_intensity_color ?
-                          static_cast<int>(255 * (point_cloud->points[i].intensity / cfg.maxlen)) :
-                          static_cast<int>(255 * (point_cloud->points[i].x / cfg.maxlen));
-        if (color_value < 0) color_value = 0;
-        if (color_value > 255) color_value = 255;
-        int color_dis_z = static_cast<int>(255 * (point_cloud->points[i].x / 10.0));
+        int color_dis_x = static_cast<int>(255 * (point.x / cfg.maxlen));
+        if (color_dis_x < 0) color_dis_x = 0;
+        if (color_dis_x > 255) color_dis_x = 255;
+        int color_dis_z = static_cast<int>(255 * (point.x / 10.0));
         if (color_dis_z > 255) color_dis_z = 255;
 
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 2, CV_RGB(255 - color_value, color_dis_z, color_value), cv::FILLED);
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_dis_x, color_dis_z, color_dis_x), cv::FILLED);
         valid_projections++;
     }
 
@@ -430,7 +417,7 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
 
     // Validate timestamps
     if (std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()) > 0.05) {
-        ROS_WARN("Timestamp mismatch: PC %f, Image %f, Diff %f", 
+        ROS_WARN("Timestamp mismatch: PC %f, Image %f, Diff %f",
                  in_pc2->header.stamp.toSec(), in_image->header.stamp.toSec(),
                  std::abs((in_pc2->header.stamp - in_image->header.stamp).toSec()));
         return;
@@ -485,7 +472,7 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image, 
 
     // Publish results
     cv_ptr->header.stamp = in_image->header.stamp;
-    pc_color->header.stamp = in_pc2->header.stamp;
+    pc_color->header.stamp = in_pc2->header.stamp.toNSec();
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
     pc_pub.publish(pc_color);
 
@@ -513,15 +500,9 @@ int main(int argc, char** argv) {
     message_filters::Subscriber<PointCloud2> pc_sub(nh, cfg.pcTopic, 1);
     message_filters::Subscriber<Image> img_sub(nh, cfg.imgTopic, 1);
 
-    if (cfg.use_exact_sync) {
-        typedef sync_policies::ExactTime<PointCloud2, Image> MySyncPolicy;
-        Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
-        sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
-    } else {
-        typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
-        Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
-        sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
-    }
+    typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
+    Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
+    sync.registerCallback(boost::bind(&callback, _1, _2, cfg));
 
     ROS_INFO("LiDAR-Camera fusion node started");
     ros::spin();
