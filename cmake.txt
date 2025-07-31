@@ -17,6 +17,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   std_msgs
   tf
+  velodyne_pointcloud
 )
 
 # Find additional dependencies
@@ -26,7 +27,7 @@ find_package(Boost REQUIRED)
 find_package(Armadillo REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS
+  CATKIN_DEPENDS roscpp sensor_msgs std_msgs cv_bridge image_transport tf velodyne_pointcloud
   DEPENDS PCL Armadillo
 )
 
