@@ -9,7 +9,7 @@
 #include <pcl/range_image/range_image_spherical.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/impl/point_types.hpp>
+#include <velodyne_pointcloud/point_types.h> // Added for PointXYZIR
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -27,7 +27,7 @@ using namespace Eigen;
 using namespace sensor_msgs;
 using namespace std;
 
-// Updated to use PointXYZIR for ring information
+// Use PointXYZIR for ring information
 typedef pcl::PointCloud<pcl::PointXYZIR> PointCloud;
 
 // Publisher
@@ -66,7 +66,10 @@ int getKernelSize(int layer) {
 
 void callback(const PointCloud::ConstPtr& msg_pointCloud)
 {
-    if (msg_pointCloud == NULL) return;
+    if (msg_pointCloud == NULL || msg_pointCloud->points.empty()) {
+        ROS_WARN("Received empty or null point cloud");
+        return;
+    }
 
     // Filter point cloud
     PointCloud::Ptr cloud_in(new PointCloud);
@@ -102,7 +105,10 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
     float min_depth = std::numeric_limits<float>::infinity();
 
     for (int ring = 0; ring < num_layers; ++ring) {
-        if (layers[ring].empty()) continue;
+        if (layers[ring].empty()) {
+            ROS_DEBUG("Layer %d is empty, skipping", ring);
+            continue;
+        }
 
         rangeImages[ring] = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
         Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
@@ -134,7 +140,10 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
     std::vector<arma::mat> ZzI_layers(num_layers);
 
     for (int ring = 0; ring < num_layers; ++ring) {
-        if (Z_layers[ring].n_elem == 0) continue;
+        if (Z_layers[ring].n_elem == 0) {
+            ROS_DEBUG("No data in layer %d, skipping interpolation", ring);
+            continue;
+        }
 
         arma::vec X = arma::regspace(1, Z_layers[ring].n_cols);
         arma::vec Y = arma::regspace(1, 1);
@@ -172,7 +181,7 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
                         for (int dj = -1; dj <= 1; ++dj) {
                             int ni = i + di;
                             int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols && ZI(ni, nj) > 0) {
                                 valid_neighbors++;
                             }
                         }
@@ -182,7 +191,7 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
                         for (int dj = -window_size; dj <= window_size; ++dj) {
                             int ni = i + di;
                             int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols && ZI(ni, nj) > 0) {
                                 double distance = std::sqrt(di * di + dj * dj);
                                 double weight = 1.0 / (distance + 1e-6);
                                 weighted_sum += ZI(ni, nj) * weight;
@@ -305,11 +314,15 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
     }
 
     // Publish point cloud
-    P_out->is_dense = true;
-    P_out->width = (int)P_out->points.size();
-    P_out->height = 1;
-    P_out->header.frame_id = "velodyne";
-    pc_pub.publish(P_out);
+    if (!P_out->points.empty()) {
+        P_out->is_dense = true;
+        P_out->width = (int)P_out->points.size();
+        P_out->height = 1;
+        P_out->header.frame_id = "velodyne";
+        pc_pub.publish(P_out);
+    } else {
+        ROS_WARN("No points to publish after interpolation");
+    }
 
     // Publish range image (using first non-empty layer for simplicity)
     int img_rows = 0, img_cols = 0;
@@ -319,6 +332,10 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
             img_cols = ZI_layers[ring].n_cols;
             break;
         }
+    }
+    if (img_rows == 0 || img_cols == 0) {
+        ROS_WARN("No valid layers for range image");
+        return;
     }
     cv::Mat interdephtImage = cv::Mat::zeros(img_rows, img_cols, cv_bridge::getCvType("mono16"));
     for (int ring = 0; ring < num_layers; ++ring) {
@@ -357,4 +374,5 @@ int main(int argc, char** argv)
     imgD_pub = nh.advertise<sensor_msgs::Image>("/pc2imageInterpol", 10);
 
     ros::spin();
+    return 0;
 }
