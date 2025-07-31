@@ -9,7 +9,7 @@
 #include <pcl/range_image/range_image_spherical.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/impl/point_types.hpp>
+#include <velodyne_pointcloud/point_types.h> // Added for PointXYZIR
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -27,7 +27,7 @@ using namespace sensor_msgs;
 using namespace message_filters;
 using namespace std;
 
-// Updated to use PointXYZIR for ring information
+// Use PointXYZIR for ring information
 typedef pcl::PointCloud<pcl::PointXYZIR> PointCloud;
 
 // Publishers
@@ -91,7 +91,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     PointCloud::Ptr msg_pointCloud(new PointCloud);
     pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
 
-    if (msg_pointCloud == NULL) return;
+    if (msg_pointCloud == NULL || msg_pointCloud->points.empty()) {
+        ROS_WARN("Received empty or null point cloud");
+        return;
+    }
 
     // Filter point cloud
     PointCloud::Ptr cloud_in(new PointCloud);
@@ -118,7 +121,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     std::vector<arma::mat> Zz_layers(num_layers);
 
     for (int ring = 0; ring < num_layers; ++ring) {
-        if (layers[ring].empty()) continue;
+        if (layers[ring].empty()) {
+            ROS_DEBUG("Layer %d is empty, skipping", ring);
+            continue;
+        }
 
         rangeImages[ring] = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
         Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
@@ -148,7 +154,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     std::vector<arma::mat> ZzI_layers(num_layers);
 
     for (int ring = 0; ring < num_layers; ++ring) {
-        if (Z_layers[ring].n_elem == 0) continue;
+        if (Z_layers[ring].n_elem == 0) {
+            ROS_DEBUG("No data in layer %d, skipping interpolation", ring);
+            continue;
+        }
 
         arma::vec X = arma::regspace(1, Z_layers[ring].n_cols);
         arma::vec Y = arma::regspace(1, 1);
@@ -161,7 +170,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
 
         arma::mat Zout = ZI;
         int window_size = getKernelSize(ring);
-        double density_threshold = 0.05;
+        // double density_threshold = 0.05; // Unused variable, commented out
 
         // Handle zeros and interpolate
         for (uint i = 0; i < ZI.n_rows; ++i) {
@@ -186,7 +195,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                         for (int dj = -1; dj <= 1; ++dj) {
                             int ni = i + di;
                             int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols && ZI(ni, nj) > 0) {
                                 valid_neighbors++;
                             }
                         }
@@ -196,7 +205,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                         for (int dj = -window_size; dj <= window_size; ++dj) {
                             int ni = i + di;
                             int nj = j + dj;
-                            if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            if (ni >= 0 && nj >= 0 && ni < (int)ZI.n_rows && nj < (int)ZI.n_cols && ZI(ni, nj) > 0) {
                                 double distance = std::sqrt(di * di + dj * dj);
                                 double weight = 1.0 / (distance + 1e-6);
                                 weighted_sum += ZI(ni, nj) * weight;
@@ -325,9 +334,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
 
     // Camera projection
     Eigen::MatrixXf RTlc(4, 4);
-    RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0),
-            Rlc(1), Rlc(4), Rlc(7), Tlc(1),
-            Rlc(2), Rlc(5), Rlc(8), Tlc(2),
+    RTlc << Rlc(0, 0), Rlc(0, 1), Rlc(0, 2), Tlc(0),
+            Rlc(1, 0), Rlc(1, 1), Rlc(1, 2), Tlc(1),
+            Rlc(2, 0), Rlc(2, 1), Rlc(2, 2), Tlc(2),
             0, 0, 0, 1;
 
     int size_inter_Lidar = (int)P_out->points.size();
@@ -349,7 +358,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         uint px_data = (int)(Lidar_cam(0, 0) / Lidar_cam(2, 0));
         uint py_data = (int)(Lidar_cam(1, 0) / Lidar_cam(2, 0));
 
-        if (px_data < 0.0 || px_data >= cols || py_data < 0.0 || py_data >= rows) continue;
+        if (px_data < 0 || px_data >= cols || py_data < 0 || py_data >= rows) continue;
 
         int color_dis_x = (int)(255 * (P_out->points[i].x / maxlen));
         int color_dis_z = (int)(255 * (P_out->points[i].x / 10.0));
@@ -369,13 +378,17 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_dis_x, color_dis_z, color_dis_x), cv::FILLED);
     }
 
-    pc_color->is_dense = true;
-    pc_color->width = (int)pc_color->points.size();
-    pc_color->height = 1;
-    pc_color->header.frame_id = "velodyne";
+    if (!pc_color->points.empty()) {
+        pc_color->is_dense = true;
+        pc_color->width = (int)pc_color->points.size();
+        pc_color->height = 1;
+        pc_color->header.frame_id = "velodyne";
+        pc_pub.publish(pc_color);
+    } else {
+        ROS_WARN("No colored points to publish");
+    }
 
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
-    pc_pub.publish(pc_color);
 }
 
 int main(int argc, char** argv)
@@ -423,4 +436,5 @@ int main(int argc, char** argv)
     pc_pub = nh.advertise<pcl::PointCloud<pcl::PointXYZRGB>>("/points2", 1);
 
     ros::spin();
+    return 0;
 }
