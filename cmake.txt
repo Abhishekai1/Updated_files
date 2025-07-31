@@ -12,6 +12,7 @@ find_package(catkin REQUIRED COMPONENTS
   eigen_conversions
   image_transport
   message_generation
+  message_filters
   roscpp
   rospy
   sensor_msgs
@@ -27,7 +28,7 @@ find_package(Boost REQUIRED)
 find_package(Armadillo REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp sensor_msgs std_msgs cv_bridge image_transport tf velodyne_pointcloud
+  CATKIN_DEPENDS roscpp sensor_msgs std_msgs cv_bridge image_transport tf message_filters velodyne_pointcloud
   DEPENDS PCL ARMADILLO
 )
 
@@ -38,7 +39,7 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${Boost_INCLUDE_DIRS}
-  ${ARMADILLO_INCLUDE_DIR}
+  ${ARMADILLO_INCLUDE_DIRS}
 )
 
 # Link libraries
@@ -55,7 +56,7 @@ target_link_libraries(lidar_camera_node
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
   ${Boost_LIBRARIES}
-  ${ARMADILLO_LIBRARY}
+  ${ARMADILLO_LIBRARIES}
 )
 
 add_executable(interpolated_node src/interpolated_lidar.cpp)
@@ -64,7 +65,7 @@ target_link_libraries(interpolated_node
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
   ${Boost_LIBRARIES}
-  ${ARMADILLO_LIBRARY}
+  ${ARMADILLO_LIBRARIES}
 )
 
 add_executable(orginal src/orginal.cpp)
@@ -73,5 +74,5 @@ target_link_libraries(orginal
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
   ${Boost_LIBRARIES}
-  ${ARMADILLO_LIBRARY}
+  ${ARMADILLO_LIBRARIES}
 )
