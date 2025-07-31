@@ -24,7 +24,7 @@ find_package(catkin REQUIRED COMPONENTS
 # Find additional dependencies
 find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system filesystem thread date_time iostreams serialization chrono atomic regex)
 find_package(Armadillo REQUIRED)
 
 catkin_package(
@@ -40,6 +40,7 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
   ${Boost_INCLUDE_DIRS}
   ${ARMADILLO_INCLUDE_DIRS}
+  ${catkin_INCLUDE_DIRS}/velodyne_pointcloud/include # Explicitly include velodyne_pointcloud headers
 )
 
 # Link libraries
