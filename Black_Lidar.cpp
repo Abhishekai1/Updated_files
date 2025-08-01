@@ -11,8 +11,11 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/impl/point_types.hpp>
 #include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 #include <iostream>
 #include <math.h>
+#include <omp.h>  // For OpenMP parallelization
 
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -23,11 +26,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 
 #include <pcl/filters/statistical_outlier_removal.h>
-
-#include <opencv2/highgui/highgui.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
 #include <armadillo>
-
 #include <chrono> 
 
 using namespace Eigen;
@@ -41,15 +40,14 @@ typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
 
-// Parameters
-float maxlen = 100.0;       // Maximum distance
-float minlen = 0.01;        // Minimum distance
-float max_FOV = 3.0;        // Max FOV in radians
-float min_FOV = 0.4;        // Min FOV in radians
+float maxlen = 100.0;       
+float minlen = 0.01;     
+float max_FOV = 3.0;    
+float min_FOV = 0.4;    
 
-// Conversion parameters
-float angular_resolution_x = 0.5f;
-float angular_resolution_y = 2.1f;
+// Optimized parameters for denser output
+float angular_resolution_x = 0.2f;  // Reduced for higher density
+float angular_resolution_y = 1.5f;  // Reduced for higher density
 float max_angle_width = 360.0f;
 float max_angle_height = 180.0f;
 float z_max = 100.0f;
@@ -57,263 +55,405 @@ float z_min = 100.0f;
 
 float max_depth = 100.0;
 float min_depth = 8.0;
-double max_var = 50.0; 
+double max_var = 75.0;  // Increased tolerance for far regions
 
-float base_interpol_value = 20.0f;
-float max_interpol_value = 30.0f;
+float interpol_value = 15.0;  // Optimized interpolation value
 
 bool f_pc = true; 
 
-// Topics
+// input topics 
 std::string imgTopic = "/camera/color/image_raw";
 std::string pcTopic = "/velodyne_points";
 
-// Calibration matrices
-Eigen::MatrixXf Tlc(3,1); // Translation matrix
-Eigen::MatrixXf Rlc(3,3); // Rotation matrix
-Eigen::MatrixXf Mc(3,4);  // Camera matrix
+//matrix calibration lidar and camera
+Eigen::MatrixXf Tlc(3,1); 
+Eigen::MatrixXf Rlc(3,3); 
+Eigen::MatrixXf Mc(3,4);  
 
-// Range image parameters
+// range image parametros
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
 
-/////////////////////////////////////// Dynamic Interpolation Functions
-
-float getDynamicInterpolationFactor(float distance, float max_distance) {
-    // Linear interpolation between base and max values
-    float ratio = distance / max_distance;
-    ratio = min(max(ratio, 0.0f), 1.0f); // Clamp to [0,1]
-    return base_interpol_value + ratio * (max_interpol_value - base_interpol_value);
-}
-
-void applyDynamicInterpolation(arma::mat& ZI, const arma::vec& X, const arma::vec& Y, float max_distance) {
-    for (uint j = 0; j < ZI.n_cols; j++) {
-        vector<pair<uint, float>> valid_points;
-        
-        // Find all valid points in column
-        for (uint i = 0; i < ZI.n_rows; i++) {
-            if (ZI(i,j) > 0) {
-                valid_points.push_back({i, ZI(i,j)});
+// Optimized single-pass interpolation with adaptive density
+arma::mat optimizedInterpolation(const arma::mat& Z, const arma::mat& Zz, float max_distance) {
+    arma::mat result = Z;
+    
+    // Pre-compute distance map for efficiency
+    arma::mat distance_map = arma::zeros(Z.n_rows, Z.n_cols);
+    
+    #pragma omp parallel for collapse(2)
+    for (uint i = 0; i < Z.n_rows; ++i) {
+        for (uint j = 0; j < Z.n_cols; ++j) {
+            if (Z(i, j) > 0) {
+                distance_map(i, j) = Z(i, j);
             }
         }
-        
-        // Sort by row index
-        sort(valid_points.begin(), valid_points.end());
-        
-        // Interpolate between points
-        for (size_t k = 0; k + 1 < valid_points.size(); k++) {
-            uint start_row = valid_points[k].first;
-            uint end_row = valid_points[k+1].first;
-            float start_val = valid_points[k].second;
-            float end_val = valid_points[k+1].second;
-            
-            float avg_dist = (start_val + end_val) / 2.0f;
-            float interpol_factor = getDynamicInterpolationFactor(avg_dist, max_distance);
-            
-            uint steps = end_row - start_row;
-            if (steps <= 1) continue;
-            
-            uint interpol_points = min(static_cast<uint>(interpol_factor), steps - 1);
-            if (interpol_points == 0) continue;
-            
-            for (uint p = 1; p <= interpol_points; p++) {
-                float t = static_cast<float>(p) / (interpol_points + 1);
-                uint target_row = start_row + static_cast<uint>(t * steps);
+    }
+    
+    // Single-pass adaptive interpolation
+    #pragma omp parallel for collapse(2)
+    for (uint i = 2; i < Z.n_rows - 2; ++i) {
+        for (uint j = 2; j < Z.n_cols - 2; ++j) {
+            if (Z(i, j) == 0) {  // Missing data point
                 
-                if (target_row < ZI.n_rows && ZI(target_row,j) == 0) {
-                    ZI(target_row,j) = start_val + t * (end_val - start_val);
+                // Quick neighborhood analysis
+                double local_avg_distance = 0.0;
+                int valid_count = 0;
+                double weighted_sum = 0.0;
+                double weight_total = 0.0;
+                
+                // Determine adaptive window size based on local density
+                int base_window = 2;
+                int adaptive_window = base_window;
+                
+                // Quick scan for local characteristics
+                for (int di = -base_window; di <= base_window; ++di) {
+                    for (int dj = -base_window; dj <= base_window; ++dj) {
+                        int ni = i + di;
+                        int nj = j + dj;
+                        if (ni >= 0 && nj >= 0 && ni < Z.n_rows && nj < Z.n_cols && Z(ni, nj) > 0) {
+                            local_avg_distance += Z(ni, nj);
+                            valid_count++;
+                        }
+                    }
+                }
+                
+                if (valid_count > 0) {
+                    local_avg_distance /= valid_count;
+                    
+                    // Adaptive window sizing
+                    if (local_avg_distance > max_distance * 0.6) {
+                        adaptive_window = 6;  // Larger window for far regions
+                    } else if (local_avg_distance > max_distance * 0.3) {
+                        adaptive_window = 4;  // Medium window
+                    } else {
+                        adaptive_window = 3;  // Small window for near regions
+                    }
+                    
+                    // Efficient weighted interpolation
+                    for (int di = -adaptive_window; di <= adaptive_window; ++di) {
+                        for (int dj = -adaptive_window; dj <= adaptive_window; ++dj) {
+                            int ni = i + di;
+                            int nj = j + dj;
+                            
+                            if (ni >= 0 && nj >= 0 && ni < Z.n_rows && nj < Z.n_cols && Z(ni, nj) > 0) {
+                                double distance = std::sqrt(di * di + dj * dj);
+                                double weight;
+                                
+                                if (local_avg_distance > max_distance * 0.5) {
+                                    // Gaussian weighting for far regions
+                                    weight = std::exp(-distance * distance / (adaptive_window * adaptive_window));
+                                } else {
+                                    // Inverse distance weighting for near regions
+                                    weight = 1.0 / (distance + 0.1);
+                                }
+                                
+                                weighted_sum += Z(ni, nj) * weight;
+                                weight_total += weight;
+                            }
+                        }
+                    }
+                    
+                    if (weight_total > 0) {
+                        result(i, j) = weighted_sum / weight_total;
+                    }
                 }
             }
         }
     }
+    
+    return result;
 }
 
-/////////////////////////////////////// Callback Function
+// Optimized dense point generation
+PointCloud::Ptr generateDensePointCloud(const arma::mat& ZI, const arma::mat& ZzI, 
+                                        float maxlen, float min_FOV, float max_FOV) {
+    PointCloud::Ptr dense_cloud(new PointCloud);
+    
+    // Pre-allocate for efficiency
+    dense_cloud->points.reserve(ZI.n_rows * ZI.n_cols);
+    
+    float ang_x_lidar = 0.6 * M_PI / 180.0;
+    
+    Eigen::Matrix3f Lidar_matrix;
+    Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
+                    0, 1, 0,
+                    -sin(ang_x_lidar), 0, cos(ang_x_lidar);
+    
+    #pragma omp parallel for collapse(2)
+    for (uint i = 0; i < ZI.n_rows; i++) {
+        for (uint j = 0; j < ZI.n_cols; j++) {
+            if (ZI(i, j) > minlen && ZI(i, j) < maxlen) {
+                
+                float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
+                
+                if (ang >= min_FOV - M_PI/2.0 && ang <= max_FOV - M_PI/2.0) {
+                    
+                    float pc_modulo = ZI(i, j);
+                    float pc_x = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * cos(ang);
+                    float pc_y = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * sin(ang);
+                    
+                    Eigen::Vector3f point_vec(pc_x, pc_y, ZzI(i, j));
+                    point_vec = Lidar_matrix * point_vec;
+                    
+                    pcl::PointXYZI point;
+                    point.x = point_vec(0);
+                    point.y = point_vec(1);
+                    point.z = point_vec(2);
+                    point.intensity = pc_modulo / maxlen * 255.0;  // Normalized intensity
+                    
+                    #pragma omp critical
+                    {
+                        dense_cloud->points.push_back(point);
+                        
+                        // Add sub-pixel interpolated points for ultra-dense visualization
+                        if (pc_modulo > maxlen * 0.3) {  // Only for medium to far ranges
+                            // Add 4 sub-points around each main point
+                            for (int sub_i = -1; sub_i <= 1; sub_i += 2) {
+                                for (int sub_j = -1; sub_j <= 1; sub_j += 2) {
+                                    pcl::PointXYZI sub_point;
+                                    sub_point.x = point_vec(0) + sub_i * 0.05;
+                                    sub_point.y = point_vec(1) + sub_j * 0.05;
+                                    sub_point.z = point_vec(2);
+                                    sub_point.intensity = point.intensity * 0.8;
+                                    dense_cloud->points.push_back(sub_point);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    dense_cloud->width = dense_cloud->points.size();
+    dense_cloud->height = 1;
+    dense_cloud->is_dense = false;
+    
+    return dense_cloud;
+}
 
-void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, const ImageConstPtr& in_image)
-{
-    // Convert ROS image to OpenCV
+// Optimized noise reduction with parallel processing
+arma::mat optimizedNoiseReduction(const arma::mat& ZI, double max_var, float maxlen, float interpol_value) {
+    arma::mat result = ZI;
+    
+    #pragma omp parallel for
+    for (uint i = 0; i < ((ZI.n_rows-1) / interpol_value); i++) {
+        for (uint j = 0; j < ZI.n_cols - 5; j++) {
+            double sum = 0;
+            double sum_sq = 0;
+            double avg_distance = 0;
+            int valid_points = 0;
+            
+            // Calculate statistics in one pass
+            for (uint k = 0; k < interpol_value; k++) {
+                uint row_idx = (i * interpol_value) + k;
+                if (row_idx < ZI.n_rows && ZI(row_idx, j) > 0) {
+                    double val = ZI(row_idx, j);
+                    sum += val;
+                    sum_sq += val * val;
+                    avg_distance += val;
+                    valid_points++;
+                }
+            }
+            
+            if (valid_points > 2) {  // Need at least 3 points for meaningful variance
+                double mean = sum / valid_points;
+                double variance = (sum_sq - sum * mean) / valid_points;
+                avg_distance /= valid_points;
+                
+                // Adaptive variance threshold
+                double adaptive_threshold = max_var;
+                if (avg_distance > maxlen * 0.6) {
+                    adaptive_threshold = max_var * 1.5;  // More lenient for far regions
+                }
+                
+                if (variance > adaptive_threshold) {
+                    for (uint m = 0; m < interpol_value; m++) {
+                        uint row_idx = (i * interpol_value) + m;
+                        if (row_idx < result.n_rows) {
+                            result(row_idx, j) = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return result;
+}
+
+void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, 
+              const ImageConstPtr& in_image) {
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
     cv_bridge::CvImagePtr cv_ptr, color_pcl;
     try {
         cv_ptr = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
         color_pcl = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
-    } catch (cv_bridge::Exception& e) {
+    }
+    catch (cv_bridge::Exception& e) {
         ROS_ERROR("cv_bridge exception: %s", e.what());
         return;
     }
 
     // Convert point cloud
     pcl::PCLPointCloud2 pcl_pc2;
-    pcl_conversions::toPCL(*in_pc2,pcl_pc2);
+    pcl_conversions::toPCL(*in_pc2, pcl_pc2);
     PointCloud::Ptr msg_pointCloud(new PointCloud);
-    pcl::fromPCLPointCloud2(pcl_pc2,*msg_pointCloud);
-    
+    pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
+
     if (msg_pointCloud == NULL) return;
 
-    // Filter point cloud
-    PointCloud::Ptr cloud_in (new PointCloud);
-    PointCloud::Ptr cloud_out (new PointCloud);
+    PointCloud::Ptr cloud_in(new PointCloud);
+    PointCloud::Ptr cloud_out(new PointCloud);
+
+    // Remove NaN points
     std::vector<int> indices;
-    
     pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
     
+    // Filter by distance - parallelized
+    cloud_out->points.reserve(cloud_in->points.size());
+    
+    #pragma omp parallel for
     for (int i = 0; i < (int)cloud_in->points.size(); i++) {
         double distance = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + 
-                             cloud_in->points[i].y * cloud_in->points[i].y);     
-        if(distance >= minlen && distance <= maxlen) {
-            cloud_out->push_back(cloud_in->points[i]);
+                              cloud_in->points[i].y * cloud_in->points[i].y);     
+        if (distance >= minlen && distance <= maxlen) {
+            #pragma omp critical
+            {
+                cloud_out->push_back(cloud_in->points[i]);
+            }
         }
     }
 
     // Create range image
-    Eigen::Affine3f sensorPose = Eigen::Affine3f::Identity();
-    rangeImage->createFromPointCloud(*cloud_out, 
-                                   pcl::deg2rad(angular_resolution_x), 
-                                   pcl::deg2rad(angular_resolution_y),
-                                   pcl::deg2rad(max_angle_width), 
-                                   pcl::deg2rad(max_angle_height),
-                                   sensorPose, 
-                                   coordinate_frame);
+    Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
+    rangeImage->pcl::RangeImage::createFromPointCloud(*cloud_out, 
+                                                      pcl::deg2rad(angular_resolution_x), 
+                                                      pcl::deg2rad(angular_resolution_y),
+                                                      pcl::deg2rad(max_angle_width), 
+                                                      pcl::deg2rad(max_angle_height),
+                                                      sensorPose, coordinate_frame, 0.0f, 0.0f, 0);
 
-    // Prepare matrices
-    arma::mat Z(rangeImage->height, rangeImage->width, arma::fill::zeros);
-    arma::mat Zz(rangeImage->height, rangeImage->width, arma::fill::zeros);
+    int cols_img = rangeImage->width;
+    int rows_img = rangeImage->height;
 
-    for (int i = 0; i < rangeImage->width; ++i) {
-        for (int j = 0; j < rangeImage->height; ++j) {
+    arma::mat Z = arma::zeros(rows_img, cols_img);         
+    arma::mat Zz = arma::zeros(rows_img, cols_img);       
+
+    // Fill range image matrices - parallelized
+    #pragma omp parallel for collapse(2)
+    for (int i = 0; i < cols_img; ++i) {
+        for (int j = 0; j < rows_img; ++j) {
             float r = rangeImage->getPoint(i, j).range;     
             float zz = rangeImage->getPoint(i, j).z; 
-       
-            if(!std::isinf(r) && r >= minlen && r <= maxlen && !std::isnan(zz)) {
-                Z(j,i) = r;   
-                Zz(j,i) = zz;
+           
+            if (!std::isinf(r) && !std::isnan(r) && !std::isnan(zz) && 
+                r >= minlen && r <= maxlen) {
+                Z(j, i) = r;   
+                Zz(j, i) = zz;
             }
         }
     }
 
-    // Interpolate
+    // Enhanced interpolation
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
-    arma::vec XI = arma::regspace(X.min(), X.max());
-    arma::vec YI = arma::regspace(Y.min(), 1.0/base_interpol_value, Y.max());
+    arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
+    arma::vec YI = arma::regspace(Y.min(), 1.0/interpol_value, Y.max());
 
     arma::mat ZI, ZzI;
-    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
-    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
+    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");  
+    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");  
 
-    // Apply dynamic interpolation
-    applyDynamicInterpolation(ZI, X, Y, maxlen);
+    // Apply optimized interpolation
+    ZI = optimizedInterpolation(ZI, ZzI, maxlen);
 
-    // Filter interpolated points
-    arma::mat Zout = ZI;
-    for (uint i = 0; i < ZI.n_rows; i++) {
-        for (uint j = 0; j < ZI.n_cols; j++) {
-            if (ZI(i,j) == 0 && i + base_interpol_value < ZI.n_rows) {
-                Zout.rows(i, i+base_interpol_value-1).col(j).zeros();
-            }
-        }
-    }
-    ZI = Zout;
-
-    // Convert back to point cloud
-    PointCloud::Ptr point_cloud(new PointCloud);
-    PointCloud::Ptr cloud(new PointCloud);
-    
-    point_cloud->width = ZI.n_cols; 
-    point_cloud->height = ZI.n_rows;
-    point_cloud->is_dense = false;
-    point_cloud->points.resize(point_cloud->width * point_cloud->height);
-
-    int num_pc = 0;
-    for (uint i = 0; i < ZI.n_rows - base_interpol_value; i += 1) {
-        for (uint j = 0; j < ZI.n_cols; j += 1) {
-            float ang = M_PI-((2.0 * M_PI * j)/(ZI.n_cols));
-
-            if (ang >= (min_FOV-M_PI/2.0) && ang <= (max_FOV-M_PI/2.0) && Zout(i,j) != 0) {  
-                float pc_modulo = Zout(i,j);
-                float pc_x = sqrt(pow(pc_modulo,2)-pow(ZzI(i,j),2)) * cos(ang);
-                float pc_y = sqrt(pow(pc_modulo,2)-pow(ZzI(i,j),2)) * sin(ang);
-
-                Eigen::MatrixXf Lidar_matrix(3,3);
-                Eigen::MatrixXf result(3,1);
-                
-                Lidar_matrix << cos(0.6*M_PI/180.0), 0, sin(0.6*M_PI/180.0),
-                               0, 1, 0,
-                               -sin(0.6*M_PI/180.0), 0, cos(0.6*M_PI/180.0);
-
-                result << pc_x, pc_y, ZzI(i,j);
-                result = Lidar_matrix * result;
-
-                point_cloud->points[num_pc].x = result(0);
-                point_cloud->points[num_pc].y = result(1);
-                point_cloud->points[num_pc].z = result(2);
-
-                cloud->push_back(point_cloud->points[num_pc]); 
-                num_pc++;
-            }
-        }
+    // Apply noise reduction if enabled
+    if (f_pc) {
+        ZI = optimizedNoiseReduction(ZI, max_var, maxlen, interpol_value);
     }
 
-    // Project to camera
-    Eigen::MatrixXf RTlc(4,4);
-    RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0),
-            Rlc(1), Rlc(4), Rlc(7), Tlc(1),
-            Rlc(2), Rlc(5), Rlc(8), Tlc(2),
-            0, 0, 0, 1;
+    // Generate dense point cloud
+    PointCloud::Ptr dense_cloud = generateDensePointCloud(ZI, ZzI, maxlen, min_FOV, max_FOV);
+
+    // Transform to camera coordinates and colorize
+    Eigen::Matrix4f RTlc;
+    RTlc.block<3,3>(0,0) = Rlc;
+    RTlc.block<3,1>(0,3) = Tlc;
+    RTlc.row(3) << 0, 0, 0, 1;
 
     unsigned int cols = in_image->width;
     unsigned int rows = in_image->height;
+
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pc_color->points.reserve(dense_cloud->points.size());
 
-    for (size_t i = 0; i < cloud->size(); i++) {
-        Eigen::MatrixXf pc_matrix(4,1);
-        pc_matrix << -cloud->points[i].y,   
-                     -cloud->points[i].z,   
-                     cloud->points[i].x,  
-                     1.0;
+    #pragma omp parallel for
+    for (int i = 0; i < (int)dense_cloud->points.size(); i++) {
+        Eigen::Vector4f pc_matrix(-dense_cloud->points[i].y, 
+                                  -dense_cloud->points[i].z, 
+                                   dense_cloud->points[i].x, 1.0);
 
-        Eigen::MatrixXf Lidar_cam = Mc * (RTlc * pc_matrix);
+        Eigen::Vector3f Lidar_cam = Mc * (RTlc * pc_matrix);
 
-        int px_data = (int)(Lidar_cam(0,0)/Lidar_cam(2,0));
-        int py_data = (int)(Lidar_cam(1,0)/Lidar_cam(2,0));
+        int px_data = (int)(Lidar_cam(0) / Lidar_cam(2));
+        int py_data = (int)(Lidar_cam(1) / Lidar_cam(2));
         
-        if(px_data < 0 || px_data >= (int)cols || py_data < 0 || py_data >= (int)rows)
-            continue;
-
-        // Color point cloud
-        cv::Vec3b color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
-        pcl::PointXYZRGB point;
-        point.x = cloud->points[i].x;
-        point.y = cloud->points[i].y;
-        point.z = cloud->points[i].z;
-        point.r = color[2];
-        point.g = color[1];
-        point.b = color[0];
-        
-        pc_color->points.push_back(point);
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, 
-                  cv::Scalar(255-(int)(255*(cloud->points[i].x/maxlen)),
-                            (int)(255*(cloud->points[i].x/10.0)),
-                            (int)(255*(cloud->points[i].x/maxlen))),
-                  cv::FILLED);
+        if (px_data >= 0 && px_data < cols && py_data >= 0 && py_data < rows) {
+            
+            pcl::PointXYZRGB point;
+            point.x = dense_cloud->points[i].x;
+            point.y = dense_cloud->points[i].y;
+            point.z = dense_cloud->points[i].z;
+            
+            cv::Vec3b & color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
+            point.r = (int)color[2]; 
+            point.g = (int)color[1]; 
+            point.b = (int)color[0];
+            
+            #pragma omp critical
+            {
+                pc_color->points.push_back(point);
+            }
+            
+            // Enhanced visualization with distance-adaptive point sizes
+            double distance = sqrt(dense_cloud->points[i].x * dense_cloud->points[i].x + 
+                                  dense_cloud->points[i].y * dense_cloud->points[i].y + 
+                                  dense_cloud->points[i].z * dense_cloud->points[i].z);
+            
+            int color_dis_x = (int)(255 * (distance / maxlen));
+            int circle_radius = (distance > maxlen * 0.6) ? 2 : 1;
+            
+            cv::circle(cv_ptr->image, cv::Point(px_data, py_data), circle_radius, 
+                      CV_RGB(255 - color_dis_x, color_dis_x, 128), cv::FILLED);
+        }
     }
 
-    // Publish results
-    pc_color->is_dense = true;
-    pc_color->width = pc_color->size();
+    pc_color->width = pc_color->points.size();
     pc_color->height = 1;
+    pc_color->is_dense = true;
     pc_color->header.frame_id = "velodyne";
 
+    // Publish results
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
     pc_pub.publish(pc_color);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    ROS_INFO("Processing time: %ld ms, Points generated: %zu", duration.count(), pc_color->points.size());
 }
 
-int main(int argc, char** argv)
-{
-    ros::init(argc, argv, "pointCloudOnImage");
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "optimized_pointCloudOnImage");
     ros::NodeHandle nh;  
-    
-    // Load parameters
+
+    // Set OpenMP threads for optimal performance
+    omp_set_num_threads(std::min(8, (int)std::thread::hardware_concurrency()));
+
+    // Load Parameters
     nh.getParam("/maxlen", maxlen);
     nh.getParam("/minlen", minlen);
     nh.getParam("/max_ang_FOV", max_FOV);
@@ -323,11 +463,11 @@ int main(int argc, char** argv)
     nh.getParam("/max_var", max_var);  
     nh.getParam("/filter_output_pc", f_pc);
     nh.getParam("/x_resolution", angular_resolution_x);
-    nh.getParam("/base_interpolation", base_interpol_value);
-    nh.getParam("/max_interpolation", max_interpol_value);
+    nh.getParam("/y_interpolation", interpol_value);
     nh.getParam("/ang_Y_resolution", angular_resolution_y);
-    
+
     XmlRpc::XmlRpcValue param;
+
     nh.getParam("/matrix_file/tlc", param);
     Tlc << (double)param[0], (double)param[1], (double)param[2];
 
@@ -341,7 +481,6 @@ int main(int argc, char** argv)
           (double)param[4], (double)param[5], (double)param[6], (double)param[7],
           (double)param[8], (double)param[9], (double)param[10], (double)param[11];
 
-    // Setup subscribers
     message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic, 1);
     message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);
 
@@ -349,10 +488,12 @@ int main(int argc, char** argv)
     Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
     sync.registerCallback(boost::bind(&callback, _1, _2));
     
-    // Setup publishers
     pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
     rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
-    pc_pub = nh.advertise<PointCloud>("/points2", 1);  
+    pc_pub = nh.advertise<PointCloud>("/points2", 1);
 
+    ROS_INFO("Optimized LiDAR-Camera Fusion Node Started");
     ros::spin();
+    
+    return 0;
 }
