@@ -91,13 +91,11 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
             continue;
 
         PointCloud::Ptr layer_cloud(new PointCloud);
-        // Fix: Use proper assignment method instead of direct vector assignment
-        layer_cloud->points.clear();
-        layer_cloud->points.reserve(layers[ring].size());
+        layer_cloud->points.reserve(layers[ring].size()); // Pre-allocate for efficiency
         for (const auto& point : layers[ring]) {
-            layer_cloud->points.push_back(point);
+            layer_cloud->points.push_back(point); // Copy points individually
         }
-        layer_cloud->width = layers[ring].size();
+        layer_cloud->width = layer_cloud->points.size();
         layer_cloud->height = 1;
         layer_cloud->is_dense = true;
 
