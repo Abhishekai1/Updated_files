@@ -5,7 +5,6 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <image_transport/image_transport.h>
 #include <pcl/point_types.h>
-#include <velodyne_pointcloud/point_types.h>
 #include <pcl/range_image/range_image.h>
 #include <pcl/range_image/range_image_spherical.h>
 #include <pcl/filters/filter.h>
@@ -24,7 +23,7 @@ using namespace Eigen;
 using namespace sensor_msgs;
 using namespace std;
 
-typedef pcl::PointCloud<pcl::PointXYZIR> PointCloud;
+typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 
 // Publisher
 ros::Publisher pc_pub;
@@ -66,9 +65,12 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
 
-    std::vector<std::vector<pcl::PointXYZIR>> layers(num_layers);
+    std::vector<std::vector<pcl::PointXYZI>> layers(num_layers);
     for (size_t i = 0; i < cloud_in->points.size(); ++i) {
-        int ring = cloud_in->points[i].ring;
+        float z = cloud_in->points[i].z;
+        float dist = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + cloud_in->points[i].y * cloud_in->points[i].y);
+        float angle = atan2(z, dist) * 180.0 / M_PI; // Vertical angle in degrees
+        int ring = round((angle + 15.0) / (30.0 / num_layers)); // Map -15° to +15° to 0-15
         if (ring < 0 || ring >= num_layers)
             continue;
         layers[ring].push_back(cloud_in->points[i]);
@@ -180,12 +182,11 @@ void callback(const PointCloud::ConstPtr& msg_pointCloud)
             result << pc_x, pc_y, ZzI(i, j);
             result = Lidar_matrix * result;
 
-            pcl::PointXYZIR pt;
+            pcl::PointXYZI pt;
             pt.x = result(0);
             pt.y = result(1);
             pt.z = result(2);
-            pt.intensity = 0.0; // Set default intensity
-            pt.ring = 0;        // Set default ring (or compute based on vertical angle if needed)
+            pt.intensity = 0.0;
             point_cloud->points[num_pc] = pt;
             P_out->push_back(pt);
             num_pc++;
