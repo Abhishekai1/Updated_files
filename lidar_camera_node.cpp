@@ -55,15 +55,30 @@ Eigen::MatrixXf camera_matrix(3, 3);
 
 void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
 {
+    if (!in_pc2 || !in_image) {
+        ROS_ERROR("Received null point cloud or image message");
+        return;
+    }
+
     pcl::PCLPointCloud2 pcl_pc2;
     pcl_conversions::toPCL(*in_pc2, pcl_pc2);
     PointCloud::Ptr msg_pointCloud(new PointCloud);
     pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
 
+    if (msg_pointCloud->empty()) {
+        ROS_WARN("Received empty point cloud");
+        return;
+    }
+
     PointCloud::Ptr cloud_in(new PointCloud);
     PointCloud::Ptr cloud_out(new PointCloud);
     std::vector<int> indices;
     pcl::removeNaNFromPointCloud(*msg_pointCloud, *cloud_in, indices);
+
+    if (cloud_in->empty()) {
+        ROS_WARN("Point cloud after NaN removal is empty");
+        return;
+    }
 
     std::vector<std::vector<pcl::PointXYZI>> layers(num_layers);
     for (size_t i = 0; i < cloud_in->points.size(); ++i) {
@@ -105,6 +120,10 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
             point << layer_cloud->points[i].x, layer_cloud->points[i].y, layer_cloud->points[i].z;
             Eigen::MatrixXf point_transformed = rlc * point + tlc;
             Eigen::MatrixXf point_camera = camera_matrix * point_transformed;
+            if (point_camera(2) == 0.0) {
+                ROS_WARN("Zero depth in camera projection, skipping point");
+                continue;
+            }
             float u = point_camera(0) / point_camera(2);
             float v = point_camera(1) / point_camera(2);
 
@@ -112,6 +131,11 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
                 cv::circle(image, cv::Point(u, v), 2, cv::Scalar(0, 255, 0), -1);
             }
         }
+    }
+
+    if (cloud_out->empty()) {
+        ROS_WARN("Output point cloud is empty");
+        return;
     }
 
     // Reconstruct 3D point cloud
@@ -123,6 +147,11 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
 
     int cols_img = rangeImage->width;
     int rows_img = rangeImage->height;
+    if (cols_img == 0 || rows_img == 0) {
+        ROS_WARN("Range image has invalid dimensions: %d x %d", cols_img, rows_img);
+        return;
+    }
+
     arma::mat Z(rows_img, cols_img, arma::fill::zeros);
     arma::mat Zz(rows_img, cols_img, arma::fill::zeros);
     Eigen::MatrixXf ZZei(rows_img, cols_img);
@@ -253,23 +282,66 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "LidarCameraFusion");
     ros::NodeHandle nh;
 
-    nh.getParam("/maxlen", maxlen);
-    nh.getParam("/minlen", minlen);
-    nh.getParam("/pcTopic", pcTopic);
-    nh.getParam("/imgTopic", imgTopic);
-    nh.getParam("/x_resolution", angular_resolution_x);
-    nh.getParam("/y_interpolation", interpol_value);
-    nh.getParam("/ang_Y_resolution", angular_resolution_y);
-    nh.getParam("/ang_ground", ang_x_lidar);
-    nh.getParam("/max_var", max_var);
-    nh.getParam("/filter_output_pc", f_pc);
-    nh.getParam("/num_layers", num_layers);
+    // Load parameters with checks
+    if (!nh.getParam("/maxlen", maxlen)) {
+        ROS_ERROR("Failed to load maxlen parameter");
+        return -1;
+    }
+    if (!nh.getParam("/minlen", minlen)) {
+        ROS_ERROR("Failed to load minlen parameter");
+        return -1;
+    }
+    if (!nh.getParam("/pcTopic", pcTopic)) {
+        ROS_ERROR("Failed to load pcTopic parameter");
+        return -1;
+    }
+    if (!nh.getParam("/imgTopic", imgTopic)) {
+        ROS_ERROR("Failed to load imgTopic parameter");
+        return -1;
+    }
+    if (!nh.getParam("/x_resolution", angular_resolution_x)) {
+        ROS_ERROR("Failed to load x_resolution parameter");
+        return -1;
+    }
+    if (!nh.getParam("/y_interpolation", interpol_value)) {
+        ROS_ERROR("Failed to load y_interpolation parameter");
+        return -1;
+    }
+    if (!nh.getParam("/ang_Y_resolution", angular_resolution_y)) {
+        ROS_ERROR("Failed to load ang_Y_resolution parameter");
+        return -1;
+    }
+    if (!nh.getParam("/ang_ground", ang_x_lidar)) {
+        ROS_ERROR("Failed to load ang_ground parameter");
+        return -1;
+    }
+    if (!nh.getParam("/max_var", max_var)) {
+        ROS_ERROR("Failed to load max_var parameter");
+        return -1;
+    }
+    if (!nh.getParam("/filter_output_pc", f_pc)) {
+        ROS_ERROR("Failed to load filter_output_pc parameter");
+        return -1;
+    }
+    if (!nh.getParam("/num_layers", num_layers)) {
+        ROS_ERROR("Failed to load num_layers parameter");
+        return -1;
+    }
 
-    // Load transformation matrices
+    // Load transformation matrices with checks
     std::vector<float> tlc_vec, rlc_vec, camera_matrix_vec;
-    nh.getParam("/tlc", tlc_vec);
-    nh.getParam("/rlc", rlc_vec);
-    nh.getParam("/camera_matrix", camera_matrix_vec);
+    if (!nh.getParam("/matrix_file/tlc", tlc_vec) || tlc_vec.size() != 3) {
+        ROS_ERROR("Failed to load tlc parameter or incorrect size");
+        return -1;
+    }
+    if (!nh.getParam("/matrix_file/rlc", rlc_vec) || rlc_vec.size() != 9) {
+        ROS_ERROR("Failed to load rlc parameter or incorrect size");
+        return -1;
+    }
+    if (!nh.getParam("/matrix_file/camera_matrix", camera_matrix_vec) || camera_matrix_vec.size() != 9) {
+        ROS_ERROR("Failed to load camera_matrix parameter or incorrect size");
+        return -1;
+    }
 
     tlc << tlc_vec[0], tlc_vec[1], tlc_vec[2];
     rlc << rlc_vec[0], rlc_vec[1], rlc_vec[2],
