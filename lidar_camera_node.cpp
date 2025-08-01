@@ -91,7 +91,10 @@ void callback(const PointCloud2ConstPtr& in_pc2, const ImageConstPtr& in_image)
             continue;
 
         PointCloud::Ptr layer_cloud(new PointCloud);
-        *layer_cloud = PointCloud(layers[ring].begin(), layers[ring].end());
+        layer_cloud->points = layers[ring]; // Copy vector directly
+        layer_cloud->width = layers[ring].size();
+        layer_cloud->height = 1;
+        layer_cloud->is_dense = true;
 
         // Project points to image
         for (size_t i = 0; i < layer_cloud->points.size(); ++i) {
