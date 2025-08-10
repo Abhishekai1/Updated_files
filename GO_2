@@ -44,8 +44,8 @@ ros::Publisher pc_pub;
 
 float maxlen =100.0;       //maxima distancia del lidar
 float minlen = 0.01;     //minima distancia del lidar
-float max_FOV = 3.0;    // en radianes angulo maximo de vista de la camara
-float min_FOV = 0.4;    // en radianes angulo minimo de vista de la camara
+float max_FOV = M_PI;    // en radianes angulo maximo de vista de la camara
+float min_FOV = 0.0;     // en radianes angulo minimo de vista de la camara
 
 /// parametros para convertir nube de puntos en imagen
 float angular_resolution_x =0.5f;
@@ -59,7 +59,7 @@ float max_depth =100.0;
 float min_depth = 8.0;
 double max_var = 50.0; 
 
-float interpol_value = 20.0;
+float interpol_value = 40.0;
 
 bool f_pc = true; 
 
