@@ -36,11 +36,11 @@ float maxlen = 100.0;      // Maximum LiDAR distance
 float minlen = 0.01;      // Minimum LiDAR distance
 float max_FOV = 3.0;      // Camera max FOV (radians)
 float min_FOV = 0.4;      // Camera min FOV (radians)
-float angular_resolution_x = 0.3f; // Reduced for denser point cloud
-float angular_resolution_y = 1.2f; // Adjusted for better vertical resolution
+float angular_resolution_x = 0.3f; // Denser point cloud
+float angular_resolution_y = 1.2f; // Better vertical resolution
 float max_angle_width = 360.0f;
 float max_angle_height = 180.0f;
-float interpol_value = 30.0; // Increased for more interpolated lines
+float interpol_value = 40.0; // Increased for more interpolated lines
 double max_var = 50.0; 
 bool f_pc = true; 
 
@@ -60,7 +60,7 @@ pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME
 // Bilateral filter for interpolation
 void applyBilateralFilter(arma::mat& Z, double sigma_spatial, double sigma_range) {
     arma::mat Z_filtered = Z;
-    int kernel_size = 5; // Adjust based on needs
+    int kernel_size = 7; // Larger kernel for far-range details
     double sigma_spatial2 = 2 * sigma_spatial * sigma_spatial;
     double sigma_range2 = 2 * sigma_range * sigma_range;
 
@@ -91,6 +91,12 @@ void applyBilateralFilter(arma::mat& Z, double sigma_spatial, double sigma_range
 }
 
 void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, const ImageConstPtr& in_image) {
+    // Validate input data
+    if (!in_pc2 || !in_image) {
+        ROS_ERROR("Invalid input: Point cloud or image is null");
+        return;
+    }
+
     cv_bridge::CvImagePtr cv_ptr, color_pcl;
     try {
         cv_ptr = cv_bridge::toCvCopy(in_image, sensor_msgs::image_encodings::BGR8);
@@ -107,7 +113,10 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
 
     // Filter point cloud
-    if (msg_pointCloud == NULL) return;
+    if (msg_pointCloud->points.empty()) {
+        ROS_WARN("Empty point cloud received");
+        return;
+    }
 
     PointCloud::Ptr cloud_in(new PointCloud);
     PointCloud::Ptr cloud_out(new PointCloud);
@@ -123,11 +132,11 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     // Adaptive statistical outlier removal
     pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
     sor.setInputCloud(cloud_out);
-    sor.setMeanK(30); // Reduced for far-range sensitivity
-    sor.setStddevMulThresh(0.8); // More permissive for far points
+    sor.setMeanK(30);
+    sor.setStddevMulThresh(0.8);
     sor.filter(*cloud_out);
 
-    // Create range image
+    // Normalize angles to prevent overflow
     Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
     rangeImage->createFromPointCloud(*cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
                                      pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height),
@@ -155,15 +164,15 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     // Interpolation
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
-    arma::vec XI = arma::regspace(X.min(), 0.5, X.max()); // Finer horizontal resolution
-    arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max()); // More vertical lines
+    arma::vec XI = arma::regspace(X.min(), 0.5, X.max());
+    arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max());
 
     arma::mat ZI, ZzI;
-    arma::interp2(X, Y, Z, XI, YI, ZI, "cubic"); // Use cubic interpolation
-    arma::interp2(X, Y, Zz, XI, YI, ZzI, "cubic");
+    arma::interp2(X, Y, Z, XI, YI, ZI, "linear"); // Use linear interpolation
+    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
 
-    // Apply bilateral filter to preserve edges
-    applyBilateralFilter(ZI, 3.0, 0.5 * (max_depth - min_depth));
+    // Apply bilateral filter with distance-weighted parameters
+    applyBilateralFilter(ZI, 4.0, 0.4 * (max_depth - min_depth));
 
     arma::mat Zout = ZI;
 
@@ -182,9 +191,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     }
     ZI = Zout;
 
-    // Adaptive interpolation for sparse regions
-    double density_threshold = 0.03; // Adjusted for far-range sensitivity
-    int max_window_size = 11; // Larger for sparse far regions
+    // Adaptive interpolation for sparse regions with distance weighting
+    double density_threshold = 0.03;
+    int max_window_size = 11;
     int min_window_size = 3;
 
     for (uint i = 1; i < ZI.n_rows - 1; ++i) {
@@ -209,7 +218,8 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
                         int nj = j + dj;
                         if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
                             double distance = std::sqrt(di * di + dj * dj);
-                            double weight = 1.0 / (distance + 1e-6);
+                            double depth_weight = ZI(ni, nj) / max_depth; // Weight by depth for far ranges
+                            double weight = (1.0 / (distance + 1e-6)) * depth_weight;
                             weighted_sum += ZI(ni, nj) * weight;
                             weight_total += weight;
                         }
@@ -236,7 +246,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         }
     }
 
-    double edge_threshold = 0.08 * arma::max(arma::max(grad_mag)); // Lowered for far-range edges
+    double edge_threshold = 0.08 * arma::max(arma::max(grad_mag));
     for (uint i = 1; i < ZI.n_rows - 1; ++i) {
         for (uint j = 1; j < ZI.n_cols - 1; ++j) {
             if (grad_mag(i, j) > edge_threshold) {
@@ -283,6 +293,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     for (uint i = 0; i < ZI.n_rows - interpol_value; i += 1) {
         for (uint j = 0; j < ZI.n_cols; j += 1) {
             float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
+            ang = fmod(ang + 2.0 * M_PI, 2.0 * M_PI); // Normalize angle
             if (ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) continue;
             if (Zout(i, j) == 0) continue;
 
@@ -323,12 +334,12 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         Eigen::MatrixXf pc_matrix(4, 1);
         pc_matrix << -cloud->points[i].y, -cloud->points[i].z, cloud->points[i].x, 1.0;
         Eigen::MatrixXf Lidar_cam = Mc * (RTlc * pc_matrix);
+        if (Lidar_cam(2, 0) <= 0) continue; // Skip points behind camera
         int px_data = (int)(Lidar_cam(0, 0) / Lidar_cam(2, 0));
         int py_data = (int)(Lidar_cam(1, 0) / Lidar_cam(2, 0));
 
         if (px_data < 0 || px_data >= cols || py_data < 0 || py_data >= rows) continue;
 
-        // Depth-based color mapping
         double depth = sqrt(pow(cloud->points[i].x, 2) + pow(cloud->points[i].y, 2) + pow(cloud->points[i].z, 2));
         int color_r = (int)(255 * (depth / maxlen));
         int color_g = (int)(255 * (1.0 - depth / maxlen));
@@ -340,7 +351,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         point.x = cloud->points[i].x;
         point.y = cloud->points[i].y;
         point.z = cloud->points[i].z;
-        point.r = color[2]; // Use camera image color
+        point.r = color[2];
         point.g = color[1];
         point.b = color[0];
         pc_color->points.push_back(point);
@@ -385,6 +396,12 @@ int main(int argc, char** argv) {
     Mc << (double)param[0], (double)param[1], (double)param[2], (double)param[3],
           (double)param[4], (double)param[5], (double)param[6], (double)param[7],
           (double)param[8], (double)param[9], (double)param[10], (double)param[11];
+
+    // Validate calibration matrices
+    if (Tlc.hasNaN() || Rlc.hasNaN() || Mc.hasNaN()) {
+        ROS_ERROR("Invalid calibration matrices detected");
+        return -1;
+    }
 
     message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic, 1);
     message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);
