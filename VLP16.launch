@@ -1,13 +1,21 @@
+<?xml version="1.0"?>
 <launch>
-  <node pkg="lidar_camera_fusion" type="interpolated_lidar" name="InterpolatedPointCloud" output="screen">
-    <param name="maxlen" value="100.0"/>
-    <param name="minlen" value="0.01"/>
-    <param name="pcTopic" value="/velodyne_points"/>
-    <param name="x_resolution" value="0.5"/>
-    <param name="y_interpolation" value="30.0"/>
-    <param name="ang_Y_resolution" value="1.0"/>
-    <param name="ang_ground" value="0.0104719755"/>
-    <param name="max_var" value="100.0"/>
-    <param name="filter_output_pc" value="true"/>
-  </node>
+    <param name="maxlen"          value="100.0" />
+    <param name="minlen"          value="0.01" />
+    <param name="pcTopic"         value="/velodyne_points" />
+    <param name="x_resolution"    value="0.5" />
+    <param name="y_interpolation" value="30.0" />
+    <param name="ang_Y_resolution" value="1.0" />
+    <param name="ang_ground"      value="0.0104719755" />
+    <param name="max_var"         value="100.0" />
+    <param name="filter_output_pc" value="true" />
+
+    <group ns="matrix_file">
+        <rosparam file="$(find lidar_camera_fusion)/cfg/cfg_params.yaml" />
+    </group>
+    
+    <node pkg="lidar_camera_fusion" type="interpolated_lidar" name="interpolated_node" output="screen"/>
+
+<!-- rviz -->
+    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find lidar_camera_fusion)/rviz/interpoled.rviz" />
 </launch>
