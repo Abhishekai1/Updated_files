@@ -1,28 +1,13 @@
 <launch>
-    <node pkg="lidar_camera_fusion" type="lidar_camera_node" name="lidar_camera_node" output="screen">
-        <rosparam file="$(find lidar_camera_fusion)/cfg/cfg_params.yaml" command="load"/>
-    </node>
-    <node pkg="nodelet" type="nodelet" name="velodyne_nodelet_manager" args="manager"/>
-    <node pkg="nodelet" type="nodelet" name="velodyne_nodelet_manager_driver" args="load velodyne_driver/DriverNodelet /velodyne_nodelet_manager">
-        <param name="model" value="VLP16"/>
-        <param name="device_ip" value="192.168.1.201"/>
-        <param name="port" value="2368"/>
-        <param name="rpm" value="600.0"/>
-        <param name="frame_id" value="velodyne"/>
-    </node>
-    <node pkg="nodelet" type="nodelet" name="velodyne_nodelet_manager_cloud" args="load velodyne_pointcloud/CloudNodelet /velodyne_nodelet_manager">
-        <param name="model" value="VLP16"/>
-        <param name="calibration" value="/opt/ros/melodic/share/velodyne_pointcloud/params/VLP16db.yaml"/>
-        <param name="min_range" value="0.4"/>
-        <param name="max_range" value="130.0"/>
-        <param name="target_frame" value="velodyne"/>
-        <param name="fixed_frame" value="velodyne"/>
-    </node>
-    <node pkg="nodelet" type="nodelet" name="velodyne_nodelet_manager_laserscan" args="load velodyne_pointcloud/LaserScanNodelet /velodyne_nodelet_manager">
-        <param name="resolution" value="0.007"/>
-        <param name="ring" value="-1"/>
-    </node>
-    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
-        <rosparam file="$(find usb_cam)/config/usb_cam.yml" command="load"/>
-    </node>
+  <node pkg="lidar_camera_fusion" type="interpolated_lidar" name="InterpolatedPointCloud" output="screen">
+    <param name="maxlen" value="100.0"/>
+    <param name="minlen" value="0.01"/>
+    <param name="pcTopic" value="/velodyne_points"/>
+    <param name="x_resolution" value="0.5"/>
+    <param name="y_interpolation" value="30.0"/>
+    <param name="ang_Y_resolution" value="1.0"/>
+    <param name="ang_ground" value="0.0104719755"/>
+    <param name="max_var" value="100.0"/>
+    <param name="filter_output_pc" value="true"/>
+  </node>
 </launch>
