@@ -1,0 +1,16 @@
+<launch>
+  <node pkg="lidar_camera_fusion" type="lidar_camera_node" name="pontCloudOntImage" output="screen">
+    <param name="maxlen" value="100.0"/>
+    <param name="minlen" value="0.01"/>
+    <param name="max_ang_FOV" value="3.0"/>
+    <param name="min_ang_FOV" value="0.4"/>
+    <param name="pcTopic" value="/velodyne_points"/>
+    <param name="imgTopic" value="/camera/color/image_raw"/>
+    <param name="max_var" value="100.0"/>
+    <param name="filter_output_pc" value="true"/>
+    <param name="x_resolution" value="0.5"/>
+    <param name="y_interpolation" value="30.0"/>
+    <param name="ang_Y_resolution" value="1.0"/>
+    <rosparam file="$(find lidar_camera_fusion)/config/matrix.yaml" command="load" ns="matrix_file"/>
+  </node>
+</launch>
