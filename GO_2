@@ -19,49 +19,76 @@
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <pcl/filters/statistical_outlier_removal.h>
-#include <Eigen/Dense>
 #include <chrono>
-#include <sstream>
 
 using namespace Eigen;
 using namespace sensor_msgs;
 using namespace message_filters;
 using namespace std;
-using namespace arma;
 
 typedef pcl::PointCloud<pcl::PointXYZI> PointCloud;
 
-// Publisher
+// Publishers
 ros::Publisher pcOnimg_pub;
 ros::Publisher pc_pub;
-ros::Publisher range_image_pub;
 
-float maxlen = 100.0;
-float minlen = 0.01;
-float max_FOV = 3.0;
-float min_FOV = 0.4;
-float angular_resolution_x = 0.5f;
-float angular_resolution_y = 2.1f;
+float maxlen = 100.0;      // Maximum LiDAR distance
+float minlen = 0.01;      // Minimum LiDAR distance
+float max_FOV = 3.0;      // Camera max FOV (radians)
+float min_FOV = 0.4;      // Camera min FOV (radians)
+float angular_resolution_x = 0.3f; // Reduced for denser point cloud
+float angular_resolution_y = 1.2f; // Adjusted for better vertical resolution
 float max_angle_width = 360.0f;
 float max_angle_height = 180.0f;
-float z_max = 100.0f;
-float z_min = 100.0f;
-float max_depth = 100.0;
-float min_depth = 8.0;
-double max_var = 50.0;
-float interpol_value = 20.0;
-float far_depth_threshold = 50.0f;
-float far_interpol_scale = 0.03f; // 33x denser for far regions
-float interpol_steepness = 0.4f;  // Sharper transition
-bool f_pc = true;
+float interpol_value = 30.0; // Increased for more interpolated lines
+double max_var = 50.0; 
+bool f_pc = true; 
+
+// Input topics 
 std::string imgTopic = "/camera/color/image_raw";
 std::string pcTopic = "/velodyne_points";
 
-Eigen::MatrixXf Tlc(3, 1);
-Eigen::MatrixXf Rlc(3, 3);
-Eigen::MatrixXf Mc(3, 4);
+// Calibration matrices
+Eigen::MatrixXf Tlc(3,1); // Translation matrix LiDAR-camera
+Eigen::MatrixXf Rlc(3,3); // Rotation matrix LiDAR-camera
+Eigen::MatrixXf Mc(3,4);  // Camera calibration matrix
+
+// Range image parameters
 boost::shared_ptr<pcl::RangeImageSpherical> rangeImage;
 pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::LASER_FRAME;
+
+// Bilateral filter for interpolation
+void applyBilateralFilter(arma::mat& Z, double sigma_spatial, double sigma_range) {
+    arma::mat Z_filtered = Z;
+    int kernel_size = 5; // Adjust based on needs
+    double sigma_spatial2 = 2 * sigma_spatial * sigma_spatial;
+    double sigma_range2 = 2 * sigma_range * sigma_range;
+
+    for (uint i = kernel_size; i < Z.n_rows - kernel_size; ++i) {
+        for (uint j = kernel_size; j < Z.n_cols - kernel_size; ++j) {
+            if (Z(i, j) == 0) continue;
+            double sum = 0.0;
+            double weight_sum = 0.0;
+            for (int di = -kernel_size; di <= kernel_size; ++di) {
+                for (int dj = -kernel_size; dj <= kernel_size; ++dj) {
+                    int ni = i + di;
+                    int nj = j + dj;
+                    if (ni >= 0 && nj >= 0 && ni < Z.n_rows && nj < Z.n_cols && Z(ni, nj) > 0) {
+                        double spatial_dist = di * di + dj * dj;
+                        double range_dist = (Z(i, j) - Z(ni, nj)) * (Z(i, j) - Z(ni, nj));
+                        double weight = exp(-spatial_dist / sigma_spatial2 - range_dist / sigma_range2);
+                        sum += weight * Z(ni, nj);
+                        weight_sum += weight;
+                    }
+                }
+            }
+            if (weight_sum > 0) {
+                Z_filtered(i, j) = sum / weight_sum;
+            }
+        }
+    }
+    Z = Z_filtered;
+}
 
 void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, const ImageConstPtr& in_image) {
     cv_bridge::CvImagePtr cv_ptr, color_pcl;
@@ -73,11 +100,13 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         return;
     }
 
+    // Convert sensor_msgs::PointCloud2 to pcl::PointCloud<T>
     pcl::PCLPointCloud2 pcl_pc2;
     pcl_conversions::toPCL(*in_pc2, pcl_pc2);
     PointCloud::Ptr msg_pointCloud(new PointCloud);
     pcl::fromPCLPointCloud2(pcl_pc2, *msg_pointCloud);
 
+    // Filter point cloud
     if (msg_pointCloud == NULL) return;
 
     PointCloud::Ptr cloud_in(new PointCloud);
@@ -87,121 +116,118 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
 
     for (int i = 0; i < (int)cloud_in->points.size(); i++) {
         double distance = sqrt(cloud_in->points[i].x * cloud_in->points[i].x + cloud_in->points[i].y * cloud_in->points[i].y);
-        if (distance < minlen || distance > maxlen)
-            continue;
+        if (distance < minlen || distance > maxlen) continue;
         cloud_out->push_back(cloud_in->points[i]);
     }
 
+    // Adaptive statistical outlier removal
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+    sor.setInputCloud(cloud_out);
+    sor.setMeanK(30); // Reduced for far-range sensitivity
+    sor.setStddevMulThresh(0.8); // More permissive for far points
+    sor.filter(*cloud_out);
+
+    // Create range image
     Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
-    rangeImage->pcl::RangeImage::createFromPointCloud(*cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
-                                                      pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height),
-                                                      sensorPose, coordinate_frame, 0.0f, 0.0f, 0);
+    rangeImage->createFromPointCloud(*cloud_out, pcl::deg2rad(angular_resolution_x), pcl::deg2rad(angular_resolution_y),
+                                     pcl::deg2rad(max_angle_width), pcl::deg2rad(max_angle_height),
+                                     sensorPose, coordinate_frame, 0.0f, 0.0f, 0);
 
     int cols_img = rangeImage->width;
     int rows_img = rangeImage->height;
 
-    arma::mat Z;
-    arma::mat Zz;
-    Z.zeros(rows_img, cols_img);
-    Zz.zeros(rows_img, cols_img);
+    arma::mat Z(rows_img, cols_img, arma::fill::zeros);  // Range
+    arma::mat Zz(rows_img, cols_img, arma::fill::zeros); // Height
 
-    Eigen::MatrixXf ZZei(rows_img, cols_img);
-
+    float max_depth = 0.0, min_depth = std::numeric_limits<float>::infinity();
     for (int i = 0; i < cols_img; ++i) {
         for (int j = 0; j < rows_img; ++j) {
-            float r = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).range;
-            float zz = rangeImage->getPoint(static_cast<int>(i), static_cast<int>(j)).z;
-            float ang = M_PI - (2.0 * M_PI * i) / cols_img; // Approximate angular position
-            if (std::isinf(r) || std::isnan(zz) || r < minlen * 1.1 || r > maxlen || ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) {
-                continue; // Stricter noise filtering
-            }
-            Z.at(j, i) = r;
-            Zz.at(j, i) = zz;
+            float r = rangeImage->getPoint(i, j).range;
+            float zz = rangeImage->getPoint(i, j).z;
+            if (std::isinf(r) || r < minlen || r > maxlen || std::isnan(zz)) continue;
+            Z(j, i) = r;
+            Zz(j, i) = zz;
+            if (r > max_depth) max_depth = r;
+            if (r < min_depth) min_depth = r;
         }
     }
 
-    ////////////////////////////////////////////// interpolation
-    //============================================================================================================
-
+    // Interpolation
     arma::vec X = arma::regspace(1, Z.n_cols);
     arma::vec Y = arma::regspace(1, Z.n_rows);
+    arma::vec XI = arma::regspace(X.min(), 0.5, X.max()); // Finer horizontal resolution
+    arma::vec YI = arma::regspace(Y.min(), 1.0 / interpol_value, Y.max()); // More vertical lines
 
-    // Depth-dependent step size for far-range densification
-    auto compute_step_size = [&](double depth) {
-        if (depth <= far_depth_threshold) {
-            return 1.0 / interpol_value;
-        }
-        double t = (depth - far_depth_threshold) * interpol_steepness;
-        double scale = far_interpol_scale / (1.0 + std::exp(-t));
-        return scale;
-    };
+    arma::mat ZI, ZzI;
+    arma::interp2(X, Y, Z, XI, YI, ZI, "cubic"); // Use cubic interpolation
+    arma::interp2(X, Y, Zz, XI, YI, ZzI, "cubic");
 
-    double min_step = compute_step_size(maxlen);
-    arma::vec XI = arma::regspace(X.min(), 1.0, X.max());
-    arma::vec YI = arma::regspace(Y.min(), min_step, Y.max());
+    // Apply bilateral filter to preserve edges
+    applyBilateralFilter(ZI, 3.0, 0.5 * (max_depth - min_depth));
 
-    arma::mat ZI_near;
-    arma::mat ZI;
-    arma::mat ZzI;
-    arma::interp2(X, Y, Z, XI, YI, ZI, "linear");
-    arma::interp2(X, Y, Zz, XI, YI, ZzI, "linear");
-
-    ROS_INFO("ZI dimensions after interp2: %d x %d", ZI.n_rows, ZI.n_cols);
-
-    // Gaussian interpolation for far regions with noise control
-    double density_threshold = 0.1;
-    int max_window_size = 11;
-    int min_window_size = 3;
     arma::mat Zout = ZI;
 
-    for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
-        for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
-            if (ZI(i, j) == 0 || ZI(i, j) > far_depth_threshold) {
-                int valid_neighbors = 0;
-                for (int di = -1; di <= 1; ++di) {
-                    for (int dj = -1; dj <= 1; ++dj) {
-                        unsigned int ni = i + di;
-                        unsigned int nj = j + dj;
-                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0 && ZI(ni, nj) < maxlen * 1.1) {
-                            valid_neighbors++;
-                        }
-                    }
+    // Handle zeros in interpolation
+    for (uint i = 0; i < ZI.n_rows; i++) {
+        for (uint j = 0; j < ZI.n_cols; j++) {
+            if (ZI(i, j) == 0) {
+                if (i + interpol_value < ZI.n_rows) {
+                    for (int k = 1; k <= interpol_value; k++) Zout(i + k, j) = 0;
                 }
-
-                int window_size = (valid_neighbors < density_threshold * 9 || ZI(i, j) > far_depth_threshold) ?
-                                  max_window_size : min_window_size;
-                double weighted_sum = 0.0;
-                double weight_total = 0.0;
-
-                for (int di = -window_size; di <= window_size; ++di) {
-                    for (int dj = -window_size; dj <= window_size; ++dj) {
-                        unsigned int ni = i + di;
-                        unsigned int nj = j + dj;
-                        if (ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0 && ZI(ni, nj) < maxlen * 1.1) {
-                            double distance = std::sqrt(di * di + dj * dj);
-                            double weight = ZI(ni, nj) > far_depth_threshold ? 2.0 / (distance + 1e-6) : 1.0 / (distance + 1e-6);
-                            weighted_sum += ZI(ni, nj) * weight;
-                            weight_total += weight;
-                        }
-                    }
-                }
-
-                if (weight_total > 0 && valid_neighbors > 1) {
-                    Zout(i, j) = weighted_sum / weight_total;
+                if (i > interpol_value) {
+                    for (int k = 1; k <= interpol_value; k++) Zout(i - k, j) = 0;
                 }
             }
         }
     }
     ZI = Zout;
 
-    // Original edge preservation
+    // Adaptive interpolation for sparse regions
+    double density_threshold = 0.03; // Adjusted for far-range sensitivity
+    int max_window_size = 11; // Larger for sparse far regions
+    int min_window_size = 3;
+
+    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
+        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
+            if (ZI(i, j) == 0) {
+                double weighted_sum = 0.0;
+                double weight_total = 0.0;
+                int valid_neighbors = 0;
+                for (int di = -1; di <= 1; ++di) {
+                    for (int dj = -1; dj <= 1; ++dj) {
+                        int ni = i + di;
+                        int nj = j + dj;
+                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            valid_neighbors++;
+                        }
+                    }
+                }
+                int window_size = (valid_neighbors < density_threshold * 9) ? max_window_size : min_window_size;
+                for (int di = -window_size; di <= window_size; ++di) {
+                    for (int dj = -window_size; dj <= window_size; ++dj) {
+                        int ni = i + di;
+                        int nj = j + dj;
+                        if (ni >= 0 && nj >= 0 && ni < ZI.n_rows && nj < ZI.n_cols && ZI(ni, nj) > 0) {
+                            double distance = std::sqrt(di * di + dj * dj);
+                            double weight = 1.0 / (distance + 1e-6);
+                            weighted_sum += ZI(ni, nj) * weight;
+                            weight_total += weight;
+                        }
+                    }
+                }
+                if (weight_total > 0) ZI(i, j) = weighted_sum / weight_total;
+            }
+        }
+    }
+
+    // Edge-preserving gradient-based enhancement
     arma::mat Zenhanced = ZI;
     arma::mat grad_x = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_y = arma::zeros(ZI.n_rows, ZI.n_cols);
     arma::mat grad_mag = arma::zeros(ZI.n_rows, ZI.n_cols);
 
-    for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
-        for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
+    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
+        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
             if (ZI(i, j) > 0) {
                 grad_x(i, j) = (ZI(i, j + 1) - ZI(i, j - 1)) * 0.5;
                 grad_y(i, j) = (ZI(i + 1, j) - ZI(i - 1, j)) * 0.5;
@@ -210,9 +236,9 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         }
     }
 
-    double edge_threshold = 0.1 * arma::max(arma::max(grad_mag));
-    for (unsigned int i = 1; i < ZI.n_rows - 1; ++i) {
-        for (unsigned int j = 1; j < ZI.n_cols - 1; ++j) {
+    double edge_threshold = 0.08 * arma::max(arma::max(grad_mag)); // Lowered for far-range edges
+    for (uint i = 1; i < ZI.n_rows - 1; ++i) {
+        for (uint j = 1; j < ZI.n_cols - 1; ++j) {
             if (grad_mag(i, j) > edge_threshold) {
                 double weight = std::max(0.0, 1.0 - grad_mag(i, j) / edge_threshold);
                 Zenhanced(i, j) = ZI(i, j) * weight + Zenhanced(i, j) * (1 - weight);
@@ -221,23 +247,22 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     }
     ZI = Zenhanced;
 
-    // Original variance-based filtering
+    // Variance-based filtering
     if (f_pc) {
-        for (unsigned int i = 0; i < ((ZI.n_rows - 1) / interpol_value); i += 1) {
-            for (unsigned int j = 0; j < ZI.n_cols - 5; j += 1) {
+        for (uint i = 0; i < ((ZI.n_rows - 1) / interpol_value); i += 1) {
+            for (uint j = 0; j < ZI.n_cols - 5; j += 1) {
                 double promedio = 0;
                 double varianza = 0;
-                for (unsigned int k = 0; k < interpol_value; k += 1) {
-                    promedio = promedio + ZI((i * interpol_value) + k, j);
+                for (uint k = 0; k < interpol_value; k += 1) {
+                    promedio += ZI((i * interpol_value) + k, j);
                 }
-                promedio = promedio / interpol_value;
-
-                for (unsigned int l = 0; l < interpol_value; l++) {
-                    varianza = varianza + pow((ZI((i * interpol_value) + l, j) - promedio), 2.0);
+                promedio /= interpol_value;
+                for (uint l = 0; l < interpol_value; l++) {
+                    varianza += pow((ZI((i * interpol_value) + l, j) - promedio), 2.0);
                 }
-
+                varianza = sqrt(varianza / interpol_value);
                 if (varianza > max_var) {
-                    for (unsigned int m = 0; m < interpol_value; m++) {
+                    for (uint m = 0; m < interpol_value; m++) {
                         Zout((i * interpol_value) + m, j) = 0;
                     }
                 }
@@ -246,40 +271,7 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
         ZI = Zout;
     }
 
-    // Debug visualization for far-range points with fixed bounds
-    if (ZI.n_rows > 0 && ZI.n_cols > 0) {
-        ROS_INFO("Creating cv::Mat with dimensions: %d x %d", ZI.n_rows, ZI.n_cols);
-        cv::Mat range_img = cv::Mat(ZI.n_rows, ZI.n_cols, CV_32F);
-        for (unsigned int i = 0; i < ZI.n_rows && i < (unsigned int)range_img.rows; ++i) {
-            for (unsigned int j = 0; j < ZI.n_cols && j < (unsigned int)range_img.cols; ++j) {
-                range_img.at<float>(i, j) = ZI(i, j);
-            }
-        }
-        cv::normalize(range_img, range_img, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-        cv::Mat far_mask = cv::Mat(ZI.n_rows, ZI.n_cols, CV_8U, cv::Scalar(0));
-        for (unsigned int i = 0; i < ZI.n_rows && i < (unsigned int)far_mask.rows; ++i) {
-            for (unsigned int j = 0; j < ZI.n_cols && j < (unsigned int)far_mask.cols; ++j) {
-                if (ZI(i, j) > far_depth_threshold) {
-                    far_mask.at<uint8_t>(i, j) = 255;
-                }
-            }
-        }
-
-        sensor_msgs::ImagePtr range_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", range_img).toImageMsg();
-        sensor_msgs::ImagePtr far_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", far_mask).toImageMsg();
-        range_msg->header.frame_id = "camera";
-        far_msg->header.frame_id = "camera";
-        range_image_pub.publish(range_msg);
-        static ros::Publisher far_mask_pub = ros::NodeHandle().advertise<sensor_msgs::Image>("/far_range_mask", 1);
-        far_mask_pub.publish(far_msg);
-    } else {
-        ROS_WARN("Skipping visualization: ZI dimensions invalid (%d x %d)", ZI.n_rows, ZI.n_cols);
-    }
-
-    //===========================================fin filtrado por imagen=================================================
-    /////////////////////////////
-
+    // Reconstruct 3D point cloud
     PointCloud::Ptr point_cloud(new PointCloud);
     PointCloud::Ptr cloud(new PointCloud);
     point_cloud->width = ZI.n_cols;
@@ -288,98 +280,78 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2, c
     point_cloud->points.resize(point_cloud->width * point_cloud->height);
 
     int num_pc = 0;
-    for (unsigned int i = 0; i < ZI.n_rows - interpol_value; i += 1) {
-        for (unsigned int j = 0; j < ZI.n_cols; j += 1) {
+    for (uint i = 0; i < ZI.n_rows - interpol_value; i += 1) {
+        for (uint j = 0; j < ZI.n_cols; j += 1) {
             float ang = M_PI - ((2.0 * M_PI * j) / (ZI.n_cols));
-            if (ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0)
-                continue;
-            if (!(Zout(i, j) == 0)) {
-                float pc_modulo = Zout(i, j);
-                float pc_x = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * cos(ang);
-                float pc_y = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * sin(ang);
+            if (ang < min_FOV - M_PI / 2.0 || ang > max_FOV - M_PI / 2.0) continue;
+            if (Zout(i, j) == 0) continue;
 
-                float ang_x_lidar = 0.6 * M_PI / 180.0;
+            float pc_modulo = Zout(i, j);
+            float pc_x = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * cos(ang);
+            float pc_y = sqrt(pow(pc_modulo, 2) - pow(ZzI(i, j), 2)) * sin(ang);
+            float ang_x_lidar = 0.6 * M_PI / 180.0;
 
-                Eigen::MatrixXf Lidar_matrix(3, 3);
-                Eigen::MatrixXf result(3, 1);
-                Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
-                                0, 1, 0,
-                                -sin(ang_x_lidar), 0, cos(ang_x_lidar);
+            Eigen::MatrixXf Lidar_matrix(3, 3);
+            Eigen::MatrixXf result(3, 1);
+            Lidar_matrix << cos(ang_x_lidar), 0, sin(ang_x_lidar),
+                            0, 1, 0,
+                            -sin(ang_x_lidar), 0, cos(ang_x_lidar);
+            result << pc_x, pc_y, ZzI(i, j);
+            result = Lidar_matrix * result;
 
-                result << pc_x, pc_y, ZzI(i, j);
-                result = Lidar_matrix * result;
-
-                point_cloud->points[num_pc].x = result(0);
-                point_cloud->points[num_pc].y = result(1);
-                point_cloud->points[num_pc].z = result(2);
-                cloud->push_back(point_cloud->points[num_pc]);
-                num_pc++;
-            }
+            point_cloud->points[num_pc].x = result(0);
+            point_cloud->points[num_pc].y = result(1);
+            point_cloud->points[num_pc].z = result(2);
+            cloud->push_back(point_cloud->points[num_pc]);
+            num_pc++;
         }
     }
 
-    PointCloud::Ptr P_out(new PointCloud);
-    P_out = cloud;
-
+    // Project LiDAR points onto camera image
     Eigen::MatrixXf RTlc(4, 4);
-    RTlc << Rlc(0), Rlc(3), Rlc(6), Tlc(0),
-            Rlc(1), Rlc(4), Rlc(7), Tlc(1),
-            Rlc(2), Rlc(5), Rlc(8), Tlc(2),
+    RTlc << Rlc(0, 0), Rlc(0, 1), Rlc(0, 2), Tlc(0),
+            Rlc(1, 0), Rlc(1, 1), Rlc(1, 2), Tlc(1),
+            Rlc(2, 0), Rlc(2, 1), Rlc(2, 2), Tlc(2),
             0, 0, 0, 1;
 
-    int size_inter_Lidar = (int)P_out->points.size();
-
-    Eigen::MatrixXf Lidar_camera(3, size_inter_Lidar);
-    Eigen::MatrixXf Lidar_cam(3, 1);
-    Eigen::MatrixXf pc_matrix(4, 1);
-    Eigen::MatrixXf pointCloud_matrix(4, size_inter_Lidar);
-
+    int size_inter_Lidar = (int)cloud->points.size();
     unsigned int cols = in_image->width;
     unsigned int rows = in_image->height;
 
-    uint px_data = 0;
-    uint py_data = 0;
-
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
-
     for (int i = 0; i < size_inter_Lidar; i++) {
-        pc_matrix(0, 0) = -P_out->points[i].y;
-        pc_matrix(1, 0) = -P_out->points[i].z;
-        pc_matrix(2, 0) = P_out->points[i].x;
-        pc_matrix(3, 0) = 1.0;
+        Eigen::MatrixXf pc_matrix(4, 1);
+        pc_matrix << -cloud->points[i].y, -cloud->points[i].z, cloud->points[i].x, 1.0;
+        Eigen::MatrixXf Lidar_cam = Mc * (RTlc * pc_matrix);
+        int px_data = (int)(Lidar_cam(0, 0) / Lidar_cam(2, 0));
+        int py_data = (int)(Lidar_cam(1, 0) / Lidar_cam(2, 0));
 
-        Lidar_cam = Mc * (RTlc * pc_matrix);
+        if (px_data < 0 || px_data >= cols || py_data < 0 || py_data >= rows) continue;
 
-        px_data = (int)(Lidar_cam(0, 0) / Lidar_cam(2, 0));
-        py_data = (int)(Lidar_cam(1, 0) / Lidar_cam(2, 0));
+        // Depth-based color mapping
+        double depth = sqrt(pow(cloud->points[i].x, 2) + pow(cloud->points[i].y, 2) + pow(cloud->points[i].z, 2));
+        int color_r = (int)(255 * (depth / maxlen));
+        int color_g = (int)(255 * (1.0 - depth / maxlen));
+        int color_b = (int)(255 * (cloud->points[i].z / 10.0));
+        if (color_b > 255) color_b = 255;
 
-        if (px_data < 0.0 || px_data >= cols || py_data < 0.0 || py_data >= rows)
-            continue;
-
-        int color_dis_x = (int)(255 * ((P_out->points[i].x) / maxlen));
-        int color_dis_z = (int)(255 * ((P_out->points[i].x) / 10.0));
-        if (color_dis_z > 255)
-            color_dis_z = 255;
-
-        cv::Vec3b& color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
-
+        cv::Vec3b &color = color_pcl->image.at<cv::Vec3b>(py_data, px_data);
         pcl::PointXYZRGB point;
-        point.x = P_out->points[i].x;
-        point.y = P_out->points[i].y;
-        point.z = P_out->points[i].z;
-        point.r = (int)color[2];
-        point.g = (int)color[1];
-        point.b = (int)color[0];
-
+        point.x = cloud->points[i].x;
+        point.y = cloud->points[i].y;
+        point.z = cloud->points[i].z;
+        point.r = color[2]; // Use camera image color
+        point.g = color[1];
+        point.b = color[0];
         pc_color->points.push_back(point);
 
-        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(255 - color_dis_x, (int)(color_dis_z), color_dis_x), cv::FILLED);
+        cv::circle(cv_ptr->image, cv::Point(px_data, py_data), 1, CV_RGB(color_r, color_g, color_b), cv::FILLED);
     }
+
     pc_color->is_dense = true;
     pc_color->width = (int)pc_color->points.size();
     pc_color->height = 1;
     pc_color->header.frame_id = "velodyne";
-    pc_color->header.stamp = in_pc2->header.stamp.toNSec();
 
     pcOnimg_pub.publish(cv_ptr->toImageMsg());
     pc_pub.publish(pc_color);
@@ -389,6 +361,7 @@ int main(int argc, char** argv) {
     ros::init(argc, argv, "pontCloudOntImage");
     ros::NodeHandle nh;
 
+    // Load parameters
     nh.getParam("/maxlen", maxlen);
     nh.getParam("/minlen", minlen);
     nh.getParam("/max_ang_FOV", max_FOV);
@@ -404,12 +377,10 @@ int main(int argc, char** argv) {
     XmlRpc::XmlRpcValue param;
     nh.getParam("/matrix_file/tlc", param);
     Tlc << (double)param[0], (double)param[1], (double)param[2];
-
     nh.getParam("/matrix_file/rlc", param);
     Rlc << (double)param[0], (double)param[1], (double)param[2],
            (double)param[3], (double)param[4], (double)param[5],
            (double)param[6], (double)param[7], (double)param[8];
-
     nh.getParam("/matrix_file/camera_matrix", param);
     Mc << (double)param[0], (double)param[1], (double)param[2], (double)param[3],
           (double)param[4], (double)param[5], (double)param[6], (double)param[7],
@@ -417,14 +388,13 @@ int main(int argc, char** argv) {
 
     message_filters::Subscriber<PointCloud2> pc_sub(nh, pcTopic, 1);
     message_filters::Subscriber<Image> img_sub(nh, imgTopic, 1);
-
     typedef sync_policies::ApproximateTime<PointCloud2, Image> MySyncPolicy;
     Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), pc_sub, img_sub);
     sync.registerCallback(boost::bind(&callback, _1, _2));
     pcOnimg_pub = nh.advertise<sensor_msgs::Image>("/pcOnImage_image", 1);
     rangeImage = boost::shared_ptr<pcl::RangeImageSpherical>(new pcl::RangeImageSpherical);
     pc_pub = nh.advertise<PointCloud>("/points2", 1);
-    range_image_pub = nh.advertise<sensor_msgs::Image>("/range_image", 1);
 
     ros::spin();
+    return 0;
 }
