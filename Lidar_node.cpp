@@ -259,6 +259,35 @@ void callback(const boost::shared_ptr<const sensor_msgs::PointCloud2>& in_pc2,
       }
     }
   }
+    
+  # Integrated Canny Edge Detection in Interpolation Phase
+// Paste below line:
+//     ZI = Zenhanced;
+// Add Canny processing for edge preservation after bilateral smoothing.
+
+cv::Mat ZI_cv(ZI.n_rows, ZI.n_cols, CV_32FC1);
+for (arma::uword i = 0; i < ZI.n_rows; ++i)
+  for (arma::uword j = 0; j < ZI.n_cols; ++j)
+    ZI_cv.at<float>(i, j) = static_cast<float>(ZI(i, j));
+
+cv::Mat ZI_8U, edges;
+double minVal, maxVal;
+cv::minMaxLoc(ZI_cv, &minVal, &maxVal);
+ZI_cv.convertTo(ZI_8U, CV_8U, 255.0 / (maxVal - minVal + 1e-6));
+
+// Apply Gaussian blur before Canny
+cv::GaussianBlur(ZI_8U, ZI_8U, cv::Size(5,5), 1.0);
+cv::Canny(ZI_8U, edges, 50, 150);
+
+// Mask out high edge regions (preserve edges)
+for (arma::uword i = 1; i + 1 < ZI.n_rows; ++i) {
+  for (arma::uword j = 1; j + 1 < ZI.n_cols; ++j) {
+    if (edges.at<uchar>(i, j) > 0) {
+      Zenhanced(i, j) = ZI(i, j);  // don't smooth at strong edge
+    }
+  }
+}
+
   ZI = Zenhanced;
 
   // ---------------- Variance-based de-flicker with far-range leniency ----------------
